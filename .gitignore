@@ -1,0 +1,12 @@
+*.exe
+*.zip
+*.pdb
+dist/
+self-test-results.txt
+development/self-test-results.txt
+status.txt
+recent.txt
+trace.txt
+maintenance.txt
+review-report.txt
+performance-offline.json
