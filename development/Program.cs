@@ -15,11 +15,29 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Clipboard to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.5.0")]
-[assembly: AssemblyFileVersion("1.1.5.0")]
+[assembly: AssemblyVersion("1.1.6.0")]
+[assembly: AssemblyFileVersion("1.1.6.0")]
 
 namespace DeepSeekBridge
 {
+    static class PortableStorage
+    {
+        internal static string Resolve(string applicationDirectory)
+        { return Path.Combine(Path.GetFullPath(applicationDirectory),"logs"); }
+        internal static void EnsureWritable(string directory)
+        {
+            try
+            {
+                Directory.CreateDirectory(directory);
+                string probe=Path.Combine(directory,".write-check-"+Guid.NewGuid().ToString("N")+".tmp");
+                using(var stream=new FileStream(probe,FileMode.CreateNew,FileAccess.Write,FileShare.None,1,FileOptions.DeleteOnClose))
+                { stream.WriteByte(0); }
+            }
+            catch(IOException) { throw new Stop("F01","无法写入程序所在文件夹的 logs 目录。请将完整压缩包解压到可写的普通文件夹后再运行，不要直接在压缩包里启动。"); }
+            catch(UnauthorizedAccessException) { throw new Stop("F01","程序所在文件夹没有写入权限。请将程序解压到你有写入权限的目录；运行记录不会改存到其他隐藏位置。"); }
+        }
+    }
+
     sealed class Stop : Exception
     {
         public readonly string Code;
@@ -67,7 +85,7 @@ namespace DeepSeekBridge
 
     static class Program
     {
-        static readonly string DataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeepSeekBridge");
+        static readonly string DataDir = PortableStorage.Resolve(AppDomain.CurrentDomain.BaseDirectory);
         static string stage = "启动";
         static int done;
         static readonly Stopwatch lifetime = Stopwatch.StartNew();
@@ -90,7 +108,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.5 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.6 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -120,8 +138,8 @@ namespace DeepSeekBridge
                 if (!created) { ShowError("B00", "上一轮操作还在运行，请稍候。此次没有重复发送。", "重复启动"); return; }
                 try
                 {
-                    Directory.CreateDirectory(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.5" + Environment.NewLine, Encoding.UTF8);
+                    PortableStorage.EnsureWritable(DataDir);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.6" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     string browser = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
@@ -225,6 +243,24 @@ namespace DeepSeekBridge
                 {"reject-stacked-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,800,700),new System.Windows.Rect(808,850,400,700))}
             };
             Maintenance.Tests(checks);
+            string storageTemp=Path.Combine(Path.GetTempPath(),"DeepSeekBridge-storage-"+Guid.NewGuid().ToString("N"));
+            string storageLogs=PortableStorage.Resolve(storageTemp);
+            try
+            {
+                PortableStorage.EnsureWritable(storageLogs);
+                checks.Add("logs-beside-application",storageLogs==Path.Combine(storageTemp,"logs"));
+                string oldWorkingDirectory=Directory.GetCurrentDirectory();
+                try
+                {
+                    Directory.SetCurrentDirectory(storageTemp);
+                    checks.Add("logs-independent-of-working-directory",PortableStorage.Resolve(AppDomain.CurrentDomain.BaseDirectory)==Path.Combine(Path.GetDirectoryName(Application.ExecutablePath),"logs"));
+                }
+                finally { Directory.SetCurrentDirectory(oldWorkingDirectory); }
+                checks.Add("logs-write-probe-cleaned",Directory.GetFiles(storageLogs).Length==0);
+                Maintenance.Record(storageLogs,"test metadata");
+                checks.Add("logs-report-in-portable-directory",File.Exists(Path.Combine(storageLogs,"review-report.txt")));
+            }
+            finally { string reportFile=Path.Combine(storageLogs,"review-report.txt"); if(File.Exists(reportFile)) File.Delete(reportFile); if(Directory.Exists(storageLogs)) Directory.Delete(storageLogs); if(Directory.Exists(storageTemp)) Directory.Delete(storageTemp); }
             string report = String.Join(Environment.NewLine, checks.Select(kv => (kv.Value ? "PASS " : "FAIL ") + kv.Key).ToArray());
             File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-results.txt"), report, Encoding.UTF8);
             Environment.ExitCode = checks.Values.All(x => x) ? 0 : 1;

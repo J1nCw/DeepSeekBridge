@@ -2,6 +2,7 @@
 *.zip
 *.pdb
 dist/
+logs/
 self-test-results.txt
 development/self-test-results.txt
 status.txt

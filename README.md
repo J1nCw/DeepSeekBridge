@@ -8,7 +8,7 @@ Windows 上的轻量基于 DeepSeek chat 的阅读助手，可在日常使用时
 
 ## 下载与使用
 
-在本仓库 **Releases** 下载 `DeepSeekBridge-v1.1.5-win-x64.zip`，解压到固定目录。
+在本仓库 **Releases** 下载 `DeepSeekBridge-v1.1.6-win-x64.zip`，解压到你有写入权限的固定目录。
 
 1. 在浏览器中登录 `https://chat.deepseek.com`。
 2. 将鼠标按键的“启动程序”指向解压后的 `DeepSeekBridge.exe`。
@@ -38,7 +38,20 @@ Windows 上的轻量基于 DeepSeek chat 的阅读助手，可在日常使用时
 
 程序仅在主动运行时工作，不开机启动、不常驻、不持续监听剪贴板。成功结束后不保留运行进程。DeepSeek 网页自身仍使用浏览器资源。
 
-记录位于 `%LOCALAPPDATA%\DeepSeekBridge`：
+从 **v1.1.6** 起，记录统一保存在 **`DeepSeekBridge.exe` 所在文件夹的 `logs` 子目录**，不依赖 Codex，也不依赖鼠标软件设置的工作目录。例如解压后的结构为：
+
+```text
+DeepSeekBridge/
+├─ DeepSeekBridge.exe
+├─ README.md
+└─ logs/                  # 首次正常运行时自动创建
+   ├─ status.txt
+   ├─ review-report.txt
+   ├─ recent.txt
+   └─ maintenance.txt
+```
+
+你把程序解压在哪里，运行记录就跟随保存在那里。请先完整解压再运行；目录不可写时会提示 `F01`，不会偷偷改存到其他位置。移动程序时一并移动 `logs` 可以保留运行历史和提醒计时。发布压缩包不附带开发者的运行日志。
 
 | 文件 | 用途 |
 |---|---|
@@ -50,6 +63,8 @@ Windows 上的轻量基于 DeepSeek chat 的阅读助手，可在日常使用时
 
 从首次使用开始，每 30 天在下一次成功调用后提醒检查运行记录。提醒 20 秒后自动关闭，也可点击打开记录文件夹。没有后台定时任务，不自动上传记录。
 
+旧版 v1.1.5 及更早版本使用 Windows 的 `%LOCALAPPDATA%\DeepSeekBridge`，那也不是 Codex 目录。新版不会自动读取或导入旧记录；如需继续保留旧历史，可在程序未运行时手动把旧目录中的记录文件复制到新 `logs` 目录，避免覆盖已有的新记录。
+
 默认摘要不保存剪贴板正文、文献标题或网址。诊断模式可包含界面控件标签，请自行检查后再分享。不要把运行记录提交到公开仓库。
 
 ## 源码构建
@@ -60,7 +75,7 @@ Windows 上的轻量基于 DeepSeek chat 的阅读助手，可在日常使用时
 
 脚本先生成候选程序，运行离线自测，通过后替换根目录 `DeepSeekBridge.exe`。失败时保留现有 EXE。构建使用 Windows 自带 C# 编译器，无 NuGet 依赖。也可运行 `DeepSeekBridge.exe --self-test` 单独验证规则，不会访问浏览器或剪贴板。
 
-v1.1.5 包含 40 项离线检查，覆盖目标网址、输入核对、布局计算、发送确认及维护提醒。离线通过不等于浏览器端到端验证。
+v1.1.6 包含 44 项离线检查，覆盖目标网址、输入核对、布局计算、发送确认、维护提醒和便携式日志目录。离线通过不等于浏览器端到端验证。
 
 ## 问题反馈
 
