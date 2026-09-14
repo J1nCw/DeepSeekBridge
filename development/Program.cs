@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Clipboard to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.6.0")]
-[assembly: AssemblyFileVersion("1.1.6.0")]
+[assembly: AssemblyVersion("1.1.7.0")]
+[assembly: AssemblyFileVersion("1.1.7.0")]
 
 namespace DeepSeekBridge
 {
@@ -54,6 +54,13 @@ namespace DeepSeekBridge
                 uri.IsDefaultPort && String.IsNullOrEmpty(uri.UserInfo);
         }
         public static bool IsBrowser(string name) { return name == "msedge" || name == "chrome"; }
+        public static bool SourceTitleMatches(string windowTitle,string tabTitle)
+        {
+            if(String.IsNullOrWhiteSpace(windowTitle) || String.IsNullOrWhiteSpace(tabTitle)) return false;
+            string title=windowTitle.Replace("\u200b","").Trim();
+            string tab=tabTitle.Replace("\u200b","").Trim();
+            return title==tab || title.StartsWith(tab+" - ",StringComparison.Ordinal) || title.StartsWith(tab+" 和另外 ",StringComparison.Ordinal);
+        }
         // Only for verifying the fixed URL we have just typed into a fresh address field.
         // Browsers may omit the scheme while editing. Never use this to verify a loaded site.
         public static bool IsTypedDestination(string value)
@@ -108,7 +115,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.6 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.7 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -139,7 +146,7 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.6" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.7" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     string browser = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
@@ -223,6 +230,10 @@ namespace DeepSeekBridge
                 {"loaded-url-still-strict", !Rules.IsDestination("chat.deepseek.com")},
                 {"edge", Rules.IsBrowser("msedge")}, {"chrome", Rules.IsBrowser("chrome")},
                 {"reject-other-browser", !Rules.IsBrowser("firefox")},
+                {"source-title-exact",Rules.SourceTitleMatches("Paper - Personal - Microsoft Edge","Paper")},
+                {"source-title-reject-prefix",!Rules.SourceTitleMatches("Paper 2 - Microsoft Edge","Paper")},
+                {"source-title-empty",!Rules.SourceTitleMatches("Microsoft Edge","")},
+                {"source-title-unicode",Rules.SourceTitleMatches("Paper - Microsoft\u200b Edge","Paper")},
                 {"line-endings", Rules.ExactText("a\r\nb", "a\nb")},
                 {"keep-whitespace", !Rules.ExactText("a ", "a")},
                 {"ack-empty-editor", Rules.SendAcknowledged("",false)},
@@ -325,6 +336,7 @@ namespace DeepSeekBridge
                 cache.Add(AutomationElement.ControlTypeProperty);
                 cache.Add(AutomationElement.IsOffscreenProperty);
                 cache.Add(AutomationElement.NameProperty);
+                cache.Add(AutomationElement.ClassNameProperty);
                 while(queue.Count>0)
                 {
                     if(++visited>2000 || scan.ElapsedMilliseconds>1800)
@@ -342,7 +354,10 @@ namespace DeepSeekBridge
                             if(info.IsOffscreen) continue;
                             var node=new EdgeNode{Element=child,Type=info.ControlType,Name=info.Name ?? ""};
                             output.Add(node); edgeNames.Remove(child); edgeNames.Add(child,node);
-                            if(node.Type!=ControlType.Document && node.Type!=ControlType.TabItem) queue.Enqueue(child);
+                            // Tab strips are queried separately only when needed. Their full
+                            // tab/group/close-button trees are irrelevant to document lookup.
+                            bool tabStrip=node.Type==ControlType.Tab || info.ClassName=="TabStrip" || info.ClassName=="VerticalTabStrip";
+                            if(node.Type!=ControlType.Document && node.Type!=ControlType.TabItem && !tabStrip) queue.Enqueue(child);
                         }
                     }
                     catch(ElementNotAvailableException) { }
@@ -364,6 +379,7 @@ namespace DeepSeekBridge
         }
         List<AutomationElement> NativeControls(ControlType type)
         {
+            if(browser=="msedge" && type==ControlType.TabItem) return EdgeTabs(false);
             if(browser=="msedge") return EdgeSnapshot().Where(n=>n.Type==type).Select(n=>n.Element).Where(Visible).ToList();
             // Prune web documents rather than traversing long papers/chat histories.
             var result = new List<AutomationElement>();
@@ -586,24 +602,58 @@ namespace DeepSeekBridge
             MenuAction(items[0]);
             createdSplitThisRun = true;
         }
+        List<AutomationElement> EdgeTabs(bool selectedOnly)
+        {
+            Guard();
+            Condition condition=new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.TabItem);
+            if(selectedOnly) condition=new AndCondition(condition,new PropertyCondition(SelectionItemPattern.IsSelectedProperty,true));
+            var cache=new CacheRequest(); cache.TreeScope=TreeScope.Element;
+            cache.Add(AutomationElement.NameProperty); cache.Add(AutomationElement.BoundingRectangleProperty);
+            var result=new List<AutomationElement>();
+            var docs=Documents();
+            AutomationElementCollection found;
+            using(cache.Activate()) found=root.FindAll(TreeScope.Descendants,condition);
+            foreach(AutomationElement tab in found)
+            {
+                try
+                {
+                    var r=tab.Cached.BoundingRectangle;
+                    // A web page may itself contain ARIA tabs. Check ancestry only for
+                    // candidates geometrically inside a visible document, not every native tab.
+                    if(docs.Any(d=>d.Current.BoundingRectangle.Contains(r) && Under(tab,d))) continue;
+                    var node=new EdgeNode{Element=tab,Type=ControlType.TabItem,Name=tab.Cached.Name ?? ""};
+                    edgeNames.Remove(tab); edgeNames.Add(tab,node); result.Add(tab);
+                }
+                catch(ElementNotAvailableException) { }
+            }
+            return result;
+        }
         void PrepareEdgeTab()
         {
             Program.Stage("Edge：准备可加入分屏的标签页");
-            var tabs=NativeControls(ControlType.TabItem);
-            var selected=tabs.Where(e=> {
-                object p; return e.TryGetCurrentPattern(SelectionItemPattern.Pattern,out p) && ((SelectionItemPattern)p).Current.IsSelected;
-            }).ToList();
-            if(selected.Count!=1) throw new Stop("S10","无法唯一识别 Edge 原阅读标签页，未新建标签页。");
+            var selected=EdgeTabs(true);
+            if(selected.Count!=1)
+            {
+                // Multi-selected tabs can all expose IsSelected. Window title is used
+                // only to pick a unique source tab, never as proof of DeepSeek origin.
+                string title=root.Current.Name ?? "";
+                var candidates=selected.Count>0 ? selected : EdgeTabs(false);
+                var matches=candidates.Where(e=>Rules.SourceTitleMatches(title,Name(e))).ToList();
+                if(matches.Count==1) selected=matches;
+            }
+            Program.Stage("Edge：源标签页候选数="+selected.Count);
+            if(selected.Count!=1) throw new Stop("S10","Edge 返回的原阅读标签页不唯一，尚未新建空白页。请先单击当前阅读标签页，再调用；这不会影响已开分屏的发送。");
             var source=selected[0];
             string sourceName=Name(source);
-            bool available=tabs.Any(e=>!Automation.Compare(e,source) &&
-                (Rules.Named(Name(e),"新建标签页","新标签页","New tab") || Name(e).IndexOf("DeepSeek",StringComparison.OrdinalIgnoreCase)>=0));
-            if(available) return;
+            // Always prepare one blank candidate for this first split. Do not enumerate
+            // every open tab looking for a title that only looks reusable.
             // The Edge picker can lack a navigable field when there is no other tab.
             // Prepare a blank tab first, then return to the exact source tab before splitting.
+            Program.Stage("Edge：新建空白标签页");
             Guard(); Native.Chord(17,84); InvalidateEdge(); Thread.Sleep(180); Guard();
             object selection;
             bool restored=false;
+            Program.Stage("Edge：返回原阅读标签页");
             for(int retry=0;retry<2 && !restored;retry++)
             {
                 try
