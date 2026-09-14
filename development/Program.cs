@@ -14,9 +14,9 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
-[assembly: AssemblyDescription("Clipboard to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.7.0")]
-[assembly: AssemblyFileVersion("1.1.7.0")]
+[assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
+[assembly: AssemblyVersion("1.1.8.0")]
+[assembly: AssemblyFileVersion("1.1.8.0")]
 
 namespace DeepSeekBridge
 {
@@ -53,6 +53,7 @@ namespace DeepSeekBridge
                 uri.Host.Equals("chat.deepseek.com", StringComparison.OrdinalIgnoreCase) &&
                 uri.IsDefaultPort && String.IsNullOrEmpty(uri.UserInfo);
         }
+        internal static bool FreshClipboard(uint before, uint observed, uint after) { return observed != before && observed == after; }
         public static bool IsBrowser(string name) { return name == "msedge" || name == "chrome"; }
         public static bool SourceTitleMatches(string windowTitle,string tabTitle)
         {
@@ -115,7 +116,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.7 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.8 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -146,20 +147,11 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.7" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.8" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     string browser = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
-                    if (!Rules.IsBrowser(browser)) throw new Stop("B01", "请先复制文字，保持 Edge 或 Chrome 在前台，再按鼠标键启动。\n不会转到默认浏览器。");
-                    string text = null;
-                    for (int i = 0; i < 6; i++)
-                    {
-                        try { if (Clipboard.ContainsText(TextDataFormat.UnicodeText)) text = Clipboard.GetText(TextDataFormat.UnicodeText); break; }
-                        catch (ExternalException) { Thread.Sleep(80); }
-                    }
-                    if (String.IsNullOrWhiteSpace(text)) throw new Stop("C01", "剪贴板没有可发送的文字。请重新复制后再启动。");
-                    if (text.Length > 30000) throw new Stop("C02", "一次最多发送 30,000 个字符，请缩短选区。");
-                    if (text.IndexOf('\0') >= 0) throw new Stop("C03", "复制的内容包含不支持的控制字符，请重新复制。");
+                    if (!Rules.IsBrowser(browser)) throw new Stop("B01", "请先选中文字，保持 Edge 或 Chrome 在前台，再按鼠标键启动。\n不会转到默认浏览器。");
                     watchdog = new System.Threading.Timer(delegate
                     {
                         if (Interlocked.Exchange(ref done, 1) != 0) return;
@@ -176,6 +168,7 @@ namespace DeepSeekBridge
                     Thread.Sleep(400);
                     var session = new Session(source, (int)pid, browser);
                     session.Guard();
+                    string text = CopySelection(session.Guard);
                     string fingerprint = Rules.Fingerprint(text);
                     string recent = Path.Combine(DataDir, "recent.txt");
                     CheckRecent(recent, source, fingerprint);
@@ -195,6 +188,43 @@ namespace DeepSeekBridge
             // Outside the send mutex: a maintenance reminder must not block another macro run.
             Maintenance.Check(DataDir);
         }
+        static string CopySelection(Action guard)
+        {
+            Stage("复制当前选中文字");
+            guard();
+            uint before = Native.GetClipboardSequenceNumber();
+            // A fresh sequence is required even when the selected text equals the old
+            // clipboard. Never clear the clipboard or fall back to stale contents.
+            Native.Chord(17, 67);
+            var wait = Stopwatch.StartNew();
+            while (wait.ElapsedMilliseconds < 1500)
+            {
+                guard();
+                uint observed = Native.GetClipboardSequenceNumber();
+                if (observed != before)
+                {
+                    try
+                    {
+                        if (Clipboard.ContainsText(TextDataFormat.UnicodeText))
+                        {
+                            string text = Clipboard.GetText(TextDataFormat.UnicodeText);
+                            uint after = Native.GetClipboardSequenceNumber();
+                            guard();
+                            if (Rules.FreshClipboard(before, observed, after) && !String.IsNullOrWhiteSpace(text))
+                            {
+                                if (text.Length > 30000) throw new Stop("C02", "一次最多发送 30,000 个字符，请缩短选区。");
+                                if (text.IndexOf('\0') >= 0) throw new Stop("C03", "选中内容包含不支持的控制字符，请重新选择。");
+                                return text;
+                            }
+                        }
+                    }
+                    catch (ExternalException) { /* Clipboard may be briefly locked by the browser. */ }
+                }
+                Thread.Sleep(30);
+            }
+            throw new Stop("C01", "未能复制当前选中文字，已停止，不会发送旧剪贴板内容。\n请在网页或 PDF 中选中文字后按鼠标键；扫描图片或禁止复制的页面可能无法复制。");
+        }
+
         static void ShowError(string code,string message,string atStage)
         {
             MessageBox.Show(message + "\n\n代码：" + code + "\n阶段：" + atStage,
@@ -216,6 +246,10 @@ namespace DeepSeekBridge
         static void SelfTest()
         {
             var checks = new Dictionary<string, bool> {
+                {"copy-reject-stale", !Rules.FreshClipboard(10,10,10)},
+                {"copy-fresh-stable", Rules.FreshClipboard(10,11,11)},
+                {"copy-reject-changing", !Rules.FreshClipboard(10,11,12)},
+                {"copy-sequence-wrap", Rules.FreshClipboard(UInt32.MaxValue,0,0)},
                 {"destination", Rules.IsDestination("https://chat.deepseek.com/a/chat/s")},
                 {"reject-http", !Rules.IsDestination("http://chat.deepseek.com")},
                 {"reject-suffix", !Rules.IsDestination("https://chat.deepseek.com.evil.test")},
@@ -912,6 +946,7 @@ namespace DeepSeekBridge
 
     static class Native
     {
+        [DllImport("user32.dll")] internal static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hwnd);
