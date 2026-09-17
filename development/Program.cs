@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.8.0")]
-[assembly: AssemblyFileVersion("1.1.8.0")]
+[assembly: AssemblyVersion("1.1.11.0")]
+[assembly: AssemblyFileVersion("1.1.11.0")]
 
 namespace DeepSeekBridge
 {
@@ -54,6 +54,50 @@ namespace DeepSeekBridge
                 uri.IsDefaultPort && String.IsNullOrEmpty(uri.UserInfo);
         }
         internal static bool FreshClipboard(uint before, uint observed, uint after) { return observed != before && observed == after; }
+        internal static bool IsBlankPage(string url)
+        {
+            if (Named(url,"about:blank")) return true;
+            Uri uri;
+            if (!Uri.TryCreate(url,UriKind.Absolute,out uri) || !String.IsNullOrEmpty(uri.UserInfo) || !uri.IsDefaultPort) return false;
+            if (uri.Scheme=="chrome-search") return uri.Host=="local-ntp" && uri.AbsolutePath=="/local-ntp.html";
+            return Named(uri.Scheme,"edge","chrome") &&
+                Named(uri.Host,"newtab","new-tab-page","new-tab-page-third-party","new-tab-page-online") &&
+                Named(uri.AbsolutePath,"","/","/index.html");
+        }
+        internal static bool DirectBlankPage(string url, int topDocuments) { return topDocuments == 1 && IsBlankPage(url); }
+        internal static bool IsNewTabTitle(string title)
+        { return Named((title ?? "").Replace("\u200b", "").Trim(),"新建标签页","新标签页","新分頁","新增索引標籤","New tab"); }
+        internal static bool NewTabWindowTitle(string title)
+        { return new[]{"新建标签页","新标签页","新分頁","新增索引標籤","New tab","New Tab"}.Any(t=>SourceTitleMatches(title,t)); }
+        internal static bool IsEdgeNewTabContent(string url)
+        {
+            Uri uri;
+            return Uri.TryCreate(url,UriKind.Absolute,out uri) && uri.Scheme=="https" && uri.IsDefaultPort &&
+                String.IsNullOrEmpty(uri.UserInfo) && Named(uri.Host,"ntp.msn.com","ntp.msn.cn") &&
+                Named(uri.AbsolutePath,"/edge/ntp","/edge/ntp/");
+        }
+        // Result: 0 normal page, 1 confirmed standalone new tab, 2 conflicting
+        // new-tab evidence (stop instead of accidentally splitting or replacing).
+        internal static int BlankRoute(string[] urls,string address,bool newTabTitle,bool split,string browser)
+        {
+            if(split) return 0;
+            bool internalPage=urls.Any(IsBlankPage);
+            bool candidate=internalPage || newTabTitle;
+            if(!candidate) return 0;
+            // null means the native address field could not be read uniquely.
+            if(address==null || (address.Length>0 && !IsBlankPage(address))) return 2;
+            bool conflict=urls.Any(url=> !String.IsNullOrWhiteSpace(url) && !IsBlankPage(url) &&
+                !(browser=="msedge" && newTabTitle && address=="" && IsEdgeNewTabContent(url)));
+            if(conflict) return 2;
+            return internalPage || (newTabTitle && address=="") ? 1 : 2;
+        }
+        internal static string ValidateInput(string text)
+        {
+            if (String.IsNullOrWhiteSpace(text)) throw new Stop("C01", "没有可查询的文字。请选中文字，或先将要查询的内容复制到剪贴板。");
+            if (text.Length > 30000) throw new Stop("C02", "一次最多发送 30,000 个字符，请缩短内容。");
+            if (text.IndexOf('\0') >= 0) throw new Stop("C03", "内容包含不支持的控制字符，请重新选择或复制。");
+            return text;
+        }
         public static bool IsBrowser(string name) { return name == "msedge" || name == "chrome"; }
         public static bool SourceTitleMatches(string windowTitle,string tabTitle)
         {
@@ -91,6 +135,167 @@ namespace DeepSeekBridge
         }
     }
 
+    static class StartupWait
+    {
+        internal static bool Released(Func<bool> held,Action guard,Action<int> pause)
+        {
+            for(int i=0;i<21;i++)
+            {
+                guard();
+                if(!held()) return true;
+                if(i<20) pause(20);
+            }
+            return false;
+        }
+        // Two agreeing observations avoid using a transient empty omnibox.
+        // A normal page (0) immediately falls through; only candidates are retried.
+        internal static bool BlankReady(Func<int> observe,Action guard,Action<int> pause)
+        {
+            int previous=0;
+            for(int i=0;i<4;i++)
+            {
+                guard(); int current=observe();
+                if(current==0) return false;
+                if(current==1 && previous==1) return true;
+                previous=current;
+                if(i<3) pause(80);
+            }
+            return false;
+        }
+        internal static void Tests(Dictionary<string,bool> checks)
+        {
+            int pauses=0,reads=0,guards=0;
+            checks.Add("startup-no-fixed-delay",Released(delegate { reads++; return false; },delegate { guards++; },delegate(int ms) { pauses+=ms; }) && reads==1 && pauses==0 && guards==1);
+            pauses=0; reads=0;
+            checks.Add("startup-waits-only-until-release",Released(delegate { return ++reads<3; },delegate {},delegate(int ms) { pauses+=ms; }) && pauses==40);
+            pauses=0;
+            checks.Add("startup-held-keys-bounded",!Released(delegate { return true; },delegate {},delegate(int ms) { pauses+=ms; }) && pauses==400);
+            pauses=0; reads=0;
+            checks.Add("route-normal-no-retry-delay",!BlankReady(delegate { reads++; return 0; },delegate {},delegate(int ms) { pauses+=ms; }) && reads==1 && pauses==0);
+            pauses=0; reads=0;
+            checks.Add("route-ready-needs-two-observations",BlankReady(delegate { reads++; return 1; },delegate {},delegate(int ms) { pauses+=ms; }) && reads==2 && pauses==80);
+            pauses=0; reads=0;
+            checks.Add("route-late-title-recovers",BlankReady(delegate { return ++reads==1 ? 2:1; },delegate {},delegate(int ms) { pauses+=ms; }) && reads==3 && pauses==160);
+            pauses=0; reads=0;
+            checks.Add("route-incomplete-state-bounded",!BlankReady(delegate { reads++; return 2; },delegate {},delegate(int ms) { pauses+=ms; }) && reads==4 && pauses==240);
+            var sequence=new Queue<int>(new[]{1,2,1,1});
+            checks.Add("route-unstable-state-resets-confirmation",BlankReady(delegate { return sequence.Dequeue(); },delegate {},delegate(int ms) {}) && sequence.Count==0);
+            sequence=new Queue<int>(new[]{1,0});
+            checks.Add("route-page-switch-cancels-fast-path",!BlankReady(delegate { return sequence.Dequeue(); },delegate {},delegate(int ms) {}) && sequence.Count==0);
+            bool stopped=false; guards=0; reads=0;
+            try { BlankReady(delegate { reads++; return 1; },delegate { if(++guards==2) throw new Stop("B02","test"); },delegate(int ms) {}); }
+            catch(Stop e) { stopped=e.Code=="B02"; }
+            checks.Add("route-focus-loss-stops-before-second-read",stopped && reads==1);
+        }
+    }
+
+    // Dependencies allow offline tests of selection priority, clipboard contention,
+    // unchanged contents and focus loss without touching the real clipboard.
+    static class QueryInput
+    {
+        internal static string Read(Action guard, Func<uint> sequence, Func<string> read,
+            Action copy, bool? hasSelection, Action<int> pause)
+        {
+            string original = null;
+            uint before = 0;
+            bool captured = false;
+            for (int i = 0; i < 6; i++)
+            {
+                guard();
+                try
+                {
+                    before = sequence(); original = read();
+                    if (before == sequence()) { captured = true; break; }
+                }
+                catch (ExternalException) { }
+                pause(30);
+            }
+            if (!captured) throw new Stop("C05", "剪贴板正在被占用或持续变化，请稍后重试。");
+            guard();
+            if (hasSelection == false)
+            {
+                Program.Stage("使用已有剪贴板文字");
+                return Rules.ValidateInput(original);
+            }
+            Program.Stage("复制当前选中文字");
+            copy();
+            bool changed = false;
+            for (int i = 0; i < 50; i++)
+            {
+                pause(30); guard();
+                uint observed = sequence();
+                changed |= observed != before;
+                if (observed == before) continue;
+                try
+                {
+                    string text = read();
+                    uint after = sequence();
+                    guard();
+                    if (Rules.FreshClipboard(before, observed, after)) return Rules.ValidateInput(text);
+                }
+                catch (ExternalException) { }
+            }
+            // Unknown selection support: Ctrl+C with no selection leaves the original
+            // clipboard unchanged. A known selection that failed to copy must not fall back.
+            if (!changed && !hasSelection.HasValue && sequence() == before)
+            {
+                Program.Stage("未复制到新选区，使用已有剪贴板文字");
+                return Rules.ValidateInput(original);
+            }
+            throw new Stop("C01", "未能稳定复制当前选区，已停止。请重新选择或手动复制后取消选区，再启动。");
+        }
+        sealed class Probe
+        {
+            internal string Text="clipboard", Copied="selection";
+            internal uint Sequence=10;
+            internal int Copies, Pauses, Locks;
+            internal bool CopiesWork=true, FocusLost, LoseFocusOnCopy, Unstable;
+            internal string Run(bool? selected)
+            {
+                return Read(delegate { if(FocusLost) throw new Stop("B02","test"); },
+                    delegate { return Sequence; },
+                    delegate {
+                        if(Locks>0) { Locks--; throw new ExternalException(); }
+                        if(Unstable) Sequence++;
+                        return Text;
+                    },
+                    delegate { Copies++; if(LoseFocusOnCopy) FocusLost=true; if(CopiesWork) { Text=Copied; Sequence++; } },
+                    selected, delegate(int ms) { Pauses++; });
+            }
+        }
+        static bool Stops(Action action,string code)
+        { try { action(); return false; } catch(Stop e) { return e.Code==code; } }
+        internal static void Tests(Dictionary<string,bool> checks)
+        {
+            var p=new Probe();
+            checks.Add("input-selection-priority",p.Run(true)=="selection" && p.Copies==1);
+            p=new Probe();
+            checks.Add("input-no-selection-clipboard",p.Run(false)=="clipboard" && p.Copies==0 && p.Pauses==0);
+            p=new Probe {CopiesWork=false};
+            checks.Add("input-unknown-selection-fallback",p.Run(null)=="clipboard" && p.Copies==1 && p.Pauses==50);
+            p=new Probe {CopiesWork=false};
+            checks.Add("input-known-copy-failure-stops",Stops(delegate { p.Run(true); },"C01"));
+            p=new Probe {Copied="clipboard"};
+            checks.Add("input-identical-selection",p.Run(true)=="clipboard" && p.Copies==1);
+            p=new Probe {Text=null};
+            checks.Add("input-empty-clipboard-stops",Stops(delegate { p.Run(false); },"C01"));
+            p=new Probe {Copied=""};
+            checks.Add("input-empty-new-copy-no-fallback",Stops(delegate { p.Run(null); },"C01"));
+            p=new Probe {Locks=2};
+            checks.Add("input-transient-lock-retries",p.Run(false)=="clipboard" && p.Pauses==2);
+            p=new Probe {Locks=8};
+            checks.Add("input-permanent-lock-stops",Stops(delegate { p.Run(null); },"C05") && p.Copies==0);
+            p=new Probe {Unstable=true};
+            checks.Add("input-changing-snapshot-stops",Stops(delegate { p.Run(null); },"C05") && p.Copies==0);
+            p=new Probe {LoseFocusOnCopy=true};
+            checks.Add("input-focus-loss-stops",Stops(delegate { p.Run(null); },"B02"));
+            p=new Probe {Text=new string('a',30001)};
+            checks.Add("input-clipboard-size-limit",Stops(delegate { p.Run(false); },"C02"));
+            p=new Probe {Text="a\0b"};
+            checks.Add("input-clipboard-control-rejected",Stops(delegate { p.Run(false); },"C03"));
+        }
+    }
+
     static class Program
     {
         static readonly string DataDir = PortableStorage.Resolve(AppDomain.CurrentDomain.BaseDirectory);
@@ -116,7 +321,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.8 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.11 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -147,11 +352,11 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.8" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.11" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     string browser = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
-                    if (!Rules.IsBrowser(browser)) throw new Stop("B01", "请先选中文字，保持 Edge 或 Chrome 在前台，再按鼠标键启动。\n不会转到默认浏览器。");
+                    if (!Rules.IsBrowser(browser)) throw new Stop("B01", "请保持 Edge 或 Chrome 在前台，再按鼠标键启动。可选中文字，也可使用已有剪贴板内容。\n不会转到默认浏览器。");
                     watchdog = new System.Threading.Timer(delegate
                     {
                         if (Interlocked.Exchange(ref done, 1) != 0) return;
@@ -165,10 +370,13 @@ namespace DeepSeekBridge
                         catch { }
                         Environment.Exit(2);
                     }, null, 10000, Timeout.Infinite);
-                    Thread.Sleep(400);
                     var session = new Session(source, (int)pid, browser);
                     session.Guard();
-                    string text = CopySelection(session.Guard);
+                    if(!StartupWait.Released(Native.LaunchKeysHeld,session.Guard,Thread.Sleep))
+                        throw new Stop("I02","启动按键仍未松开，请松开后再调用。");
+                    string text = QueryInput.Read(session.Guard, Native.GetClipboardSequenceNumber,
+                        delegate { return Clipboard.ContainsText(TextDataFormat.UnicodeText) ? Clipboard.GetText(TextDataFormat.UnicodeText) : null; },
+                        delegate { session.Guard(); Native.Chord(17,67); }, session.HasSelection(), Thread.Sleep);
                     string fingerprint = Rules.Fingerprint(text);
                     string recent = Path.Combine(DataDir, "recent.txt");
                     CheckRecent(recent, source, fingerprint);
@@ -188,43 +396,6 @@ namespace DeepSeekBridge
             // Outside the send mutex: a maintenance reminder must not block another macro run.
             Maintenance.Check(DataDir);
         }
-        static string CopySelection(Action guard)
-        {
-            Stage("复制当前选中文字");
-            guard();
-            uint before = Native.GetClipboardSequenceNumber();
-            // A fresh sequence is required even when the selected text equals the old
-            // clipboard. Never clear the clipboard or fall back to stale contents.
-            Native.Chord(17, 67);
-            var wait = Stopwatch.StartNew();
-            while (wait.ElapsedMilliseconds < 1500)
-            {
-                guard();
-                uint observed = Native.GetClipboardSequenceNumber();
-                if (observed != before)
-                {
-                    try
-                    {
-                        if (Clipboard.ContainsText(TextDataFormat.UnicodeText))
-                        {
-                            string text = Clipboard.GetText(TextDataFormat.UnicodeText);
-                            uint after = Native.GetClipboardSequenceNumber();
-                            guard();
-                            if (Rules.FreshClipboard(before, observed, after) && !String.IsNullOrWhiteSpace(text))
-                            {
-                                if (text.Length > 30000) throw new Stop("C02", "一次最多发送 30,000 个字符，请缩短选区。");
-                                if (text.IndexOf('\0') >= 0) throw new Stop("C03", "选中内容包含不支持的控制字符，请重新选择。");
-                                return text;
-                            }
-                        }
-                    }
-                    catch (ExternalException) { /* Clipboard may be briefly locked by the browser. */ }
-                }
-                Thread.Sleep(30);
-            }
-            throw new Stop("C01", "未能复制当前选中文字，已停止，不会发送旧剪贴板内容。\n请在网页或 PDF 中选中文字后按鼠标键；扫描图片或禁止复制的页面可能无法复制。");
-        }
-
         static void ShowError(string code,string message,string atStage)
         {
             MessageBox.Show(message + "\n\n代码：" + code + "\n阶段：" + atStage,
@@ -250,6 +421,37 @@ namespace DeepSeekBridge
                 {"copy-fresh-stable", Rules.FreshClipboard(10,11,11)},
                 {"copy-reject-changing", !Rules.FreshClipboard(10,11,12)},
                 {"copy-sequence-wrap", Rules.FreshClipboard(UInt32.MaxValue,0,0)},
+                {"blank-edge", Rules.DirectBlankPage("edge://newtab/",1)},
+                {"blank-chrome", Rules.DirectBlankPage("chrome://newtab/",1)},
+                {"blank-about", Rules.DirectBlankPage("about:blank",1)},
+                {"blank-local-ntp", Rules.DirectBlankPage("chrome-search://local-ntp/local-ntp.html",1)},
+                {"blank-existing-split-preserved", !Rules.DirectBlankPage("edge://newtab/",2)},
+                {"blank-no-document-rejected", !Rules.DirectBlankPage("edge://newtab/",0)},
+                {"blank-web-title-not-url", !Rules.DirectBlankPage("New tab",1)},
+                {"blank-web-url-rejected", !Rules.DirectBlankPage("https://example.com/newtab",1)},
+                {"blank-settings-rejected", !Rules.DirectBlankPage("edge://settings/",1)},
+                {"blank-unknown-url-rejected", !Rules.DirectBlankPage("",1)},
+                {"blank-prefix-rejected", !Rules.DirectBlankPage("edge://newtab.evil/",1)},
+                {"blank-third-party-chrome", Rules.IsBlankPage("chrome://new-tab-page-third-party/")},
+                {"blank-online-edge", Rules.IsBlankPage("edge://new-tab-page-online/index.html?locale=zh-CN")},
+                {"route-edge-provider", Rules.BlankRoute(new[]{"https://ntp.msn.com/edge/ntp?locale=zh-CN"},"",true,false,"msedge")==1},
+                {"route-edge-cn-provider", Rules.BlankRoute(new[]{"https://ntp.msn.cn/edge/ntp"},"",true,false,"msedge")==1},
+                {"route-chrome-third-party", Rules.BlankRoute(new[]{"chrome://new-tab-page-third-party/"},"",true,false,"chrome")==1},
+                {"route-no-document-yet", Rules.BlankRoute(new string[0],"",true,false,"chrome")==1},
+                {"route-multiple-document-single-page", Rules.BlankRoute(new[]{"chrome://newtab/",""},"",true,false,"chrome")==1},
+                {"route-newtab-title-unavailable", Rules.BlankRoute(new[]{"edge://newtab/"},"",false,false,"msedge")==1},
+                {"route-existing-split", Rules.BlankRoute(new[]{"edge://newtab/"},"",true,true,"msedge")==0},
+                {"route-regular-web", Rules.BlankRoute(new[]{"https://example.com"},"example.com",false,false,"chrome")==0},
+                {"route-regular-pdf", Rules.BlankRoute(new[]{"file:///C:/paper.pdf"},"C:/paper.pdf",false,false,"msedge")==0},
+                {"route-address-draft-preserved", Rules.BlankRoute(new[]{"chrome://newtab/"},"unfinished search",true,false,"chrome")==2},
+                {"route-address-unreadable", Rules.BlankRoute(new[]{"chrome://newtab/"},null,true,false,"chrome")==2},
+                {"route-title-alone-not-enough", Rules.BlankRoute(new[]{"https://example.com"},"",true,false,"chrome")==2},
+                {"route-typed-newtab-not-loaded", Rules.BlankRoute(new[]{"https://example.com"},"chrome://newtab/",true,false,"chrome")==2},
+                {"route-provider-not-any-msn-page", Rules.BlankRoute(new[]{"https://ntp.msn.com/news"},"",true,false,"msedge")==2},
+                {"route-provider-spoof-rejected", Rules.BlankRoute(new[]{"https://ntp.msn.com.evil/edge/ntp"},"",true,false,"msedge")==2},
+                {"route-provider-needs-native-title", Rules.BlankRoute(new[]{"https://ntp.msn.com/edge/ntp"},"",false,false,"msedge")==0},
+                {"route-provider-manually-opened", Rules.BlankRoute(new[]{"https://ntp.msn.com/edge/ntp"},"https://ntp.msn.com/edge/ntp",false,false,"msedge")==0},
+                {"route-about-blank", Rules.BlankRoute(new[]{"about:blank"},"about:blank",false,false,"chrome")==1},
                 {"destination", Rules.IsDestination("https://chat.deepseek.com/a/chat/s")},
                 {"reject-http", !Rules.IsDestination("http://chat.deepseek.com")},
                 {"reject-suffix", !Rules.IsDestination("https://chat.deepseek.com.evil.test")},
@@ -287,6 +489,8 @@ namespace DeepSeekBridge
                 {"reject-nested-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,1200,700),new System.Windows.Rect(800,100,400,700))},
                 {"reject-stacked-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,800,700),new System.Windows.Rect(808,850,400,700))}
             };
+            StartupWait.Tests(checks);
+            QueryInput.Tests(checks);
             Maintenance.Tests(checks);
             string storageTemp=Path.Combine(Path.GetTempPath(),"DeepSeekBridge-storage-"+Guid.NewGuid().ToString("N"));
             string storageLogs=PortableStorage.Resolve(storageTemp);
@@ -334,6 +538,33 @@ namespace DeepSeekBridge
             uint currentPid; Native.GetWindowThreadProcessId(hwnd, out currentPid);
             if (Native.GetForegroundWindow() != hwnd || currentPid != pid || !Native.IsWindow(hwnd))
                 throw new Stop("B02", "当前窗口已改变，已停止操作。请回到原来的浏览器再启动。");
+        }
+        public bool? HasSelection()
+        {
+            Guard();
+            var focused = AutomationElement.FocusedElement;
+            if (focused == null || !Under(focused,root)) throw new Stop("B02", "浏览器焦点无法确认，请回到原页面再启动。");
+            // Omnibox auto-selection is browser chrome, never source text.
+            if (IsNativeAddress(focused)) return false;
+            try
+            {
+                var node = focused;
+                for (int i=0; node!=null && i<16 && !Automation.Compare(node,root); i++)
+                {
+                    object pattern;
+                    if (node.TryGetCurrentPattern(TextPattern.Pattern,out pattern))
+                    {
+                        var text = (TextPattern)pattern;
+                        if (text.SupportedTextSelection != SupportedTextSelection.None)
+                            return text.GetSelection().Any(range => range.GetText(1).Length > 0);
+                    }
+                    node=TreeWalker.ControlViewWalker.GetParent(node);
+                }
+            }
+            catch (ElementNotAvailableException) { Guard(); }
+            catch (InvalidOperationException) { Guard(); }
+            // PDF providers may not expose selection. Use the native copy path.
+            return null;
         }
         static bool Visible(AutomationElement e) { try { return !e.Current.IsOffscreen && e.Current.BoundingRectangle.Width > 0; } catch { return false; } }
         static string Name(AutomationElement e) { try { EdgeNode node; return edgeNames.TryGetValue(e,out node) ? node.Name : (e.Current.Name ?? ""); } catch { return ""; } }
@@ -523,6 +754,20 @@ namespace DeepSeekBridge
         {
             return Rules.Named(name, "地址和搜索栏", "地址栏", "地址和搜索", "地址和搜索框", "Address and search bar", "Address bar", "搜索或输入网址", "搜索或输入 Web 地址", "Search or enter web address", "Search or enter URL", "Search tabs or enter a URL", "搜索标签页或输入网址");
         }
+        bool IsNativeAddress(AutomationElement element)
+        {
+            if(element==null || !IsAddressName(Name(element))) return false;
+            try
+            {
+                for(int i=0;element!=null && i<30;i++,element=TreeWalker.ControlViewWalker.GetParent(element))
+                {
+                    if(Automation.Compare(element,root)) return true;
+                    if(element.Current.ControlType==ControlType.Document) return false;
+                }
+            }
+            catch(ElementNotAvailableException) { }
+            return false;
+        }
         void ClickControl(AutomationElement element, bool right)
         {
             Guard(); var r = element.Current.BoundingRectangle;
@@ -566,6 +811,81 @@ namespace DeepSeekBridge
             var address = AutomationElement.FocusedElement;
             if (!Under(address,root) || Documents().Any(d => Under(address,d)) || !IsAddressName(Name(address)))
                 throw new Stop("S06", "新标签页的原生地址栏未能确认，已停止导航。");
+            FillFreshAddress(address);
+        }
+        bool IsStandaloneBlank()
+        {
+            if(StartupWait.BlankReady(FastBlankSnapshot,Guard,Thread.Sleep))
+            { Program.Stage("新标签页识别：外层快速确认"); return true; }
+            return IsStandaloneBlankFull();
+        }
+        int FastBlankSnapshot()
+        {
+            Guard(); InvalidateEdge();
+            try
+            {
+                bool title=Rules.NewTabWindowTitle(Name(root));
+                // Newly opened tabs may expose the empty focused omnibox before
+                // the window title updates. Briefly retry that transition too.
+                if(!title)
+                {
+                    var focused=AutomationElement.FocusedElement;
+                    return IsNativeAddress(focused) && Value(focused)=="" ? 2 : 0;
+                }
+                var address=NativeControls(ControlType.Edit).Where(e=>IsAddressName(Name(e))).ToList();
+                string value=address.Count==1 ? Value(address[0]) : null;
+                if(value!=null && value.Length>0) return 0;
+                // No page descendants, selected-tab lookup, or load completion is
+                // required. Already exposed document URLs still veto normal pages.
+                var docs=Documents();
+                bool split=docs.Any(a=>docs.Any(b=>!Automation.Compare(a,b) && Rules.SideBySide(a.Current.BoundingRectangle,b.Current.BoundingRectangle)));
+                if(split) return 0;
+                var top=docs.Where(d=>!docs.Any(other=>!Automation.Compare(d,other) && Under(d,other))).ToList();
+                return Rules.BlankRoute(top.Select(DocumentUrl).ToArray(),value,title,false,browser)==1 ? 1 : 2;
+            }
+            catch(ElementNotAvailableException) { return 2; }
+        }
+        bool IsStandaloneBlankFull()
+        {
+            Guard();
+            var docs=Documents();
+            // Document count is not pane count: a new-tab page can expose several
+            // documents. Only real adjacent pane geometry establishes a split.
+            bool split=docs.Any(a=>docs.Any(b=>!Automation.Compare(a,b) && Rules.SideBySide(a.Current.BoundingRectangle,b.Current.BoundingRectangle)));
+            if(split) return false;
+            var top=docs.Where(d => !docs.Any(other => !Automation.Compare(d,other) && Under(d,other))).ToList();
+            string[] urls=top.Select(DocumentUrl).ToArray();
+            // Window title is a cheap gate; query selected native tabs only for a
+            // possible new tab, so ordinary pages keep the existing fast path.
+            string windowTitle=Name(root);
+            bool titleHint=Rules.NewTabWindowTitle(windowTitle);
+            if(!titleHint && !urls.Any(Rules.IsBlankPage)) return false;
+            bool newTabTitle=false;
+            if(titleHint)
+            {
+                var tabs=browser=="msedge" ? EdgeTabs(true) : NativeControls(ControlType.TabItem).Where(e=> {
+                    object pattern;
+                    return e.TryGetCurrentPattern(SelectionItemPattern.Pattern,out pattern) && ((SelectionItemPattern)pattern).Current.IsSelected;
+                }).ToList();
+                newTabTitle=tabs.Count==1 && Rules.IsNewTabTitle(Name(tabs[0])) && Rules.SourceTitleMatches(windowTitle,Name(tabs[0]));
+            }
+            var address=NativeControls(ControlType.Edit).Where(e=>IsAddressName(Name(e))).ToList();
+            string addressValue=address.Count==1 ? Value(address[0]) : null;
+            int route=Rules.BlankRoute(urls,addressValue,newTabTitle,split,browser);
+            // Record categories only, never URLs, titles or address-bar drafts.
+            Program.Stage("新标签页识别：文档="+top.Count+" 地址栏="+address.Count+" 空地址="+(addressValue=="")+" 标签确认="+newTabTitle+" 分支="+route);
+            if(route==2 || (titleHint && route==0))
+                throw new Stop("N01","检测到新标签页，但页面与地址栏状态尚未一致。请等待页面加载完成；若正在编辑地址栏，请先按 Esc 取消未提交的输入，再调用。此次没有新建分屏或覆盖页面。");
+            return route==1;
+        }
+        void NavigateBlankPage()
+        {
+            Program.Stage("空白标签页：直接打开 DeepSeek");
+            Guard(); Native.Chord(17,76); Thread.Sleep(100); Guard();
+            InvalidateEdge();
+            var address=AutomationElement.FocusedElement;
+            if (!IsStandaloneBlank() || !IsNativeAddress(address))
+                throw new Stop("S11","当前标签页已变化或无法确认空白页，已停止直接导航。");
             FillFreshAddress(address);
         }
         bool WaitForTypedAddress(AutomationElement address)
@@ -880,16 +1200,18 @@ namespace DeepSeekBridge
         public void Run(string text, Action markAttempt)
         {
             Program.Stage("确认 DeepSeek 网页");
-            AutomationElement doc = Destination();
-            if (doc == null)
+            AutomationElement doc = null;
+            if (IsStandaloneBlank()) NavigateBlankPage();
+            else
             {
-                TryOpenSplit();
-                for (int i = 0; i < 25 && doc == null; i++) { Guard(); doc = Destination(); if (doc == null) Thread.Sleep(250); }
+                doc = Destination();
+                if (doc == null) TryOpenSplit();
             }
-            if (doc == null) throw new Stop("U03", "无法确认 DeepSeek 网址与输入框。\n请确认右侧已登录、页面加载完成。若已经满足，当前浏览器的可访问性控件需要进一步适配。");
+            for (int i = 0; i < 25 && doc == null; i++) { Guard(); doc = Destination(); if (doc == null) Thread.Sleep(250); }
+            if (doc == null) throw new Stop("U03", "无法确认 DeepSeek 网址与输入框。\n请确认 DeepSeek 已登录、页面加载完成。若已经满足，当前浏览器的可访问性控件需要进一步适配。");
             Guard();
             if(createdSplitThisRun) doc = Arrange(doc);
-            else Program.Trace("LAYOUT existing-split-preserved");
+            else Program.Trace("LAYOUT preserved");
             Program.Stage("检查草稿和生成状态");
             if (Busy(doc)) throw new Stop("D02", "DeepSeek 正在回答，请等回答结束后再启动。没有填入或发送本次文字。");
             var editors = Editors(doc);
@@ -1004,6 +1326,11 @@ namespace DeepSeekBridge
         {
             if ((GetAsyncKeyState(16) & 0x8000) != 0 || (GetAsyncKeyState(17) & 0x8000) != 0 || (GetAsyncKeyState(18) & 0x8000) != 0)
                 throw new Stop("I02", "请松开 Ctrl、Shift、Alt 等按键，再启动程序。");
+        }
+        internal static bool LaunchKeysHeld()
+        {
+            // Do not synthesize key-up events for physical user input.
+            return new[]{1,2,4,5,6,16,17,18,91,92}.Any(key=>(GetAsyncKeyState(key)&0x8000)!=0);
         }
         internal static void Enter() { CheckModifiers(); Submit(new INPUT[] { Key(13,0,0), Key(13,0,2) }); }
         internal static void Escape() { CheckModifiers(); Submit(new INPUT[]{Key(27,0,0),Key(27,0,2)}); }
