@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.11.0")]
-[assembly: AssemblyFileVersion("1.1.11.0")]
+[assembly: AssemblyVersion("1.1.13.0")]
+[assembly: AssemblyFileVersion("1.1.13.0")]
 
 namespace DeepSeekBridge
 {
@@ -296,6 +296,140 @@ namespace DeepSeekBridge
         }
     }
 
+    static class DefaultBrowser
+    {
+        [DllImport("shlwapi.dll", CharSet=CharSet.Unicode)]
+        static extern int AssocQueryStringW(uint flags,uint kind,string association,string extra,StringBuilder output,ref uint length);
+        internal static string ResolvePath()
+        {
+            // ASSOCF_IS_PROTOCOL queries the current user's HTTPS handler.
+            uint length=0;
+            int result=AssocQueryStringW(0x1000,2,"https","open",null,ref length);
+            if(result<0 || length<2 || length>32768) throw new Stop("B03","无法读取系统默认浏览器。请先在 Windows 默认应用中设置 Edge 或 Chrome。");
+            var value=new StringBuilder((int)length);
+            if(AssocQueryStringW(0x1000,2,"https","open",value,ref length)!=0)
+                throw new Stop("B03","无法读取系统默认浏览器，请检查 Windows 默认应用设置。");
+            string path=value.ToString();
+            if(!SupportedPath(path)) throw new Stop("B03","跨应用自动查询目前要求系统默认浏览器为 Edge 或 Chrome。此次没有发送文字，也没有更改默认浏览器设置。");
+            return Path.GetFullPath(path);
+        }
+        internal static bool SupportedPath(string path)
+        {
+            try
+            {
+                return !String.IsNullOrWhiteSpace(path) && path.IndexOf('"')<0 && Path.IsPathRooted(path) &&
+                    Path.GetPathRoot(path).EndsWith("\\",StringComparison.Ordinal) &&
+                    Rules.Named(Path.GetFileName(path),"chrome.exe","msedge.exe");
+            }
+            catch(ArgumentException) { return false; }
+            catch(NotSupportedException) { return false; }
+        }
+        internal static bool Matches(string expected,string actual)
+        { return SupportedPath(expected) && SupportedPath(actual) && String.Equals(Path.GetFullPath(expected),Path.GetFullPath(actual),StringComparison.OrdinalIgnoreCase); }
+        internal sealed class BrowserWindow
+        {
+            internal IntPtr Handle;
+            internal uint Pid;
+            internal string Title;
+        }
+        static List<BrowserWindow> Windows(string expected)
+        {
+            var found=new List<BrowserWindow>();
+            var matching=new Dictionary<uint,bool>();
+            foreach(var hwnd in Native.TopBrowserWindows())
+            {
+                uint pid; Native.GetWindowThreadProcessId(hwnd,out pid);
+                bool matches;
+                if(!matching.TryGetValue(pid,out matches))
+                {
+                    matches=false;
+                    try
+                    {
+                        using(var process=Process.GetProcessById((int)pid))
+                            matches=Rules.IsBrowser(process.ProcessName.ToLowerInvariant()) && Matches(expected,process.MainModule.FileName);
+                    }
+                    catch(ArgumentException) { }
+                    catch(InvalidOperationException) { }
+                    catch(System.ComponentModel.Win32Exception) { }
+                    matching[pid]=matches;
+                }
+                if(matches) found.Add(new BrowserWindow { Handle=hwnd, Pid=pid, Title=Native.WindowTitle(hwnd) });
+            }
+            return found;
+        }
+        internal static BrowserWindow ChooseWindow(List<BrowserWindow> before,List<BrowserWindow> after)
+        {
+            var changed=after.Where(w=>w.Title.IndexOf("DeepSeek",StringComparison.OrdinalIgnoreCase)>=0 &&
+                !before.Any(old=>old.Handle==w.Handle && old.Pid==w.Pid && old.Title==w.Title)).ToList();
+            if(changed.Count==1) return changed[0];
+            if(changed.Count>1) return null;
+            var added=after.Where(w=>!before.Any(old=>old.Handle==w.Handle && old.Pid==w.Pid)).ToList();
+            if(added.Count==1) return added[0];
+            return after.Count==1 ? after[0] : null;
+        }
+        internal static void Tests(Dictionary<string,bool> checks)
+        {
+            var empty=new List<BrowserWindow>();
+            var a=new BrowserWindow {Handle=new IntPtr(1),Pid=10,Title="Reading"};
+            var b=new BrowserWindow {Handle=new IntPtr(2),Pid=10,Title="Another window"};
+            var changed=new BrowserWindow {Handle=a.Handle,Pid=a.Pid,Title="DeepSeek"};
+            var added=new BrowserWindow {Handle=new IntPtr(3),Pid=10,Title="Loading"};
+            checks.Add("activate-no-window-waits",ChooseWindow(empty,empty)==null);
+            checks.Add("activate-single-existing-window",ChooseWindow(new List<BrowserWindow>{a},new List<BrowserWindow>{a})==a);
+            checks.Add("activate-cold-start-window",ChooseWindow(empty,new List<BrowserWindow>{added})==added);
+            checks.Add("activate-ambiguous-windows-wait",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{a,b})==null);
+            checks.Add("activate-new-window-over-existing",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{a,b,added})==added);
+            checks.Add("activate-changed-deepseek-window",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{changed,b})==changed);
+            checks.Add("activate-unchanged-deepseek-not-proof",ChooseWindow(new List<BrowserWindow>{changed,b},new List<BrowserWindow>{changed,b})==null);
+            var changedB=new BrowserWindow {Handle=b.Handle,Pid=b.Pid,Title="DeepSeek"};
+            checks.Add("activate-two-deepseek-changes-ambiguous",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{changed,changedB})==null);
+            var reused=new BrowserWindow {Handle=a.Handle,Pid=20,Title="New browser"};
+            checks.Add("activate-reused-handle-new-process",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{reused,b})==reused);
+        }
+        internal static Session Open(string expected,Action guardSource)
+        {
+            guardSource();
+            IntPtr sourceWindow=Native.GetForegroundWindow();
+            var before=Windows(expected);
+            // Grant only the known browser process, never ASFW_ANY.
+            var browserPids=before.Select(w=>w.Pid).Distinct().ToList();
+            if(browserPids.Count==1) Native.AllowSetForegroundWindow(browserPids[0]);
+            guardSource(); Program.Stage("通过系统默认浏览器打开 DeepSeek");
+            // Only the fixed HTTPS URL is passed to the shell, never selected text.
+            try { using(var launched=Process.Start(new ProcessStartInfo("https://chat.deepseek.com/") { UseShellExecute=true })) { } }
+            catch(System.ComponentModel.Win32Exception) { throw new Stop("B04","系统未能打开默认浏览器，本次没有发送。请检查默认浏览器设置。"); }
+            Program.Stage("寻找并激活默认浏览器窗口");
+            int activationAttempts=0;
+            IntPtr activated=IntPtr.Zero;
+            for(int i=0;i<30;i++)
+            {
+                var windows=Windows(expected);
+                IntPtr foreground=Native.GetForegroundWindow();
+                var current=windows.FirstOrDefault(w=>w.Handle==foreground);
+                if(current!=null)
+                {
+                    Program.Stage("默认浏览器前台已确认");
+                    return new Session(current.Handle,(int)current.Pid,Path.GetFileNameWithoutExtension(expected).ToLowerInvariant());
+                }
+                // User switching to a third app cancels activation, instead of
+                // repeatedly stealing focus while they work elsewhere.
+                if(foreground!=IntPtr.Zero && foreground!=sourceWindow && foreground!=activated)
+                    throw new Stop("B02","等待默认浏览器时前台切换到了其他应用，已停止。本次没有输入或发送文字。");
+                var candidate=ChooseWindow(before,windows);
+                if(candidate!=null && activationAttempts<3 && i%4==0)
+                {
+                    activated=candidate.Handle; activationAttempts++;
+                    Program.Stage("激活默认浏览器窗口：尝试="+activationAttempts);
+                    // Candidate titles select a window only; Session still verifies
+                    // the actual DeepSeek origin and editor before pasting.
+                    Native.ActivateBrowser(candidate.Handle,candidate.Pid);
+                }
+                Thread.Sleep(100);
+            }
+            throw new Stop("B05","已打开 DeepSeek，但未能唯一确认并激活默认浏览器窗口。请单击目标浏览器使其来到前台后再调用；本次没有输入或发送文字。");
+        }
+    }
+
     static class Program
     {
         static readonly string DataDir = PortableStorage.Resolve(AppDomain.CurrentDomain.BaseDirectory);
@@ -321,7 +455,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.11 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.13 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -342,7 +476,7 @@ namespace DeepSeekBridge
                 return;
             }
             DiagnosticsEnabled=args.Contains("--diagnostics");
-            // Capture before creating any window. Never fall back to default browser or another window.
+            // Capture the source before launching a browser or creating any window.
             IntPtr source = Native.GetForegroundWindow();
             bool created;
             string failureCode=null, failureMessage=null;
@@ -352,11 +486,13 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.11" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.13" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
-                    string browser = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant();
-                    if (!Rules.IsBrowser(browser)) throw new Stop("B01", "请保持 Edge 或 Chrome 在前台，再按鼠标键启动。可选中文字，也可使用已有剪贴板内容。\n不会转到默认浏览器。");
+                    if(source==IntPtr.Zero || pid==0) throw new Stop("B01","未能确认当前窗口，请回到要查询的应用后再调用。");
+                    string browser;
+                    using(var process=Process.GetProcessById((int)pid)) browser=process.ProcessName.ToLowerInvariant();
+                    bool external=!Rules.IsBrowser(browser);
                     watchdog = new System.Threading.Timer(delegate
                     {
                         if (Interlocked.Exchange(ref done, 1) != 0) return;
@@ -374,17 +510,24 @@ namespace DeepSeekBridge
                     session.Guard();
                     if(!StartupWait.Released(Native.LaunchKeysHeld,session.Guard,Thread.Sleep))
                         throw new Stop("I02","启动按键仍未松开，请松开后再调用。");
+                    string expectedBrowser=external ? DefaultBrowser.ResolvePath() : null;
+                    string selection=external ? session.ExternalSelection() : null;
                     string text = QueryInput.Read(session.Guard, Native.GetClipboardSequenceNumber,
                         delegate { return Clipboard.ContainsText(TextDataFormat.UnicodeText) ? Clipboard.GetText(TextDataFormat.UnicodeText) : null; },
-                        delegate { session.Guard(); Native.Chord(17,67); }, session.HasSelection(), Thread.Sleep);
+                        delegate {
+                            session.Guard();
+                            if(external) CopyExternalSelection(selection,session.Guard);
+                            else Native.Chord(17,67);
+                        }, external ? (bool?)(selection!=null) : session.HasSelection(), Thread.Sleep);
                     string fingerprint = Rules.Fingerprint(text);
                     string recent = Path.Combine(DataDir, "recent.txt");
                     CheckRecent(recent, source, fingerprint);
+                    if(external) session=DefaultBrowser.Open(expectedBrowser,session.Guard);
                     session.Run(text, delegate
                     {
                         Directory.CreateDirectory(DataDir);
                         File.WriteAllText(recent, DateTime.UtcNow.Ticks + "|" + source.ToInt64() + "|" + fingerprint);
-                    });
+                    },external);
                     EndWatchdog();
                     Status("SENT_ACKNOWLEDGED");
                 }
@@ -401,6 +544,17 @@ namespace DeepSeekBridge
             MessageBox.Show(message + "\n\n代码：" + code + "\n阶段：" + atStage,
                 "DeepSeekBridge · 操作未完成",MessageBoxButtons.OK,MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button1,MessageBoxOptions.DefaultDesktopOnly);
+        }
+        static void CopyExternalSelection(string selection,Action guard)
+        {
+            Rules.ValidateInput(selection);
+            for(int i=0;i<4;i++)
+            {
+                guard();
+                try { Clipboard.SetText(selection,TextDataFormat.UnicodeText); return; }
+                catch(ExternalException) { if(i<3) Thread.Sleep(30); }
+            }
+            throw new Stop("C05","无法将当前选区复制到剪贴板，请稍后重试。");
         }
         static void EndWatchdog() { Interlocked.Exchange(ref done, 1); if (watchdog != null) watchdog.Dispose(); }
         static void CheckRecent(string path, IntPtr hwnd, string fingerprint)
@@ -421,6 +575,16 @@ namespace DeepSeekBridge
                 {"copy-fresh-stable", Rules.FreshClipboard(10,11,11)},
                 {"copy-reject-changing", !Rules.FreshClipboard(10,11,12)},
                 {"copy-sequence-wrap", Rules.FreshClipboard(UInt32.MaxValue,0,0)},
+                {"default-chrome-path",DefaultBrowser.SupportedPath(@"C:\Program Files\Google\Chrome\Application\chrome.exe")},
+                {"default-edge-path",DefaultBrowser.SupportedPath(@"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")},
+                {"default-case-insensitive",DefaultBrowser.SupportedPath(@"C:\Apps\CHROME.EXE")},
+                {"default-reject-other-browser",!DefaultBrowser.SupportedPath(@"C:\Apps\firefox.exe")},
+                {"default-reject-relative-path",!DefaultBrowser.SupportedPath("chrome.exe")},
+                {"default-reject-command-line",!DefaultBrowser.SupportedPath("\"C:\\Apps\\chrome.exe\" --url")},
+                {"default-reject-empty",!DefaultBrowser.SupportedPath(null)},
+                {"default-same-install",DefaultBrowser.Matches(@"C:\Apps\chrome.exe",@"c:\apps\CHROME.EXE")},
+                {"default-reject-other-install",!DefaultBrowser.Matches(@"C:\Apps\chrome.exe",@"D:\Other\chrome.exe")},
+                {"default-reject-wrong-browser",!DefaultBrowser.Matches(@"C:\Apps\chrome.exe",@"C:\Apps\msedge.exe")},
                 {"blank-edge", Rules.DirectBlankPage("edge://newtab/",1)},
                 {"blank-chrome", Rules.DirectBlankPage("chrome://newtab/",1)},
                 {"blank-about", Rules.DirectBlankPage("about:blank",1)},
@@ -489,6 +653,7 @@ namespace DeepSeekBridge
                 {"reject-nested-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,1200,700),new System.Windows.Rect(800,100,400,700))},
                 {"reject-stacked-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,800,700),new System.Windows.Rect(808,850,400,700))}
             };
+            DefaultBrowser.Tests(checks);
             StartupWait.Tests(checks);
             QueryInput.Tests(checks);
             Maintenance.Tests(checks);
@@ -537,7 +702,46 @@ namespace DeepSeekBridge
         {
             uint currentPid; Native.GetWindowThreadProcessId(hwnd, out currentPid);
             if (Native.GetForegroundWindow() != hwnd || currentPid != pid || !Native.IsWindow(hwnd))
-                throw new Stop("B02", "当前窗口已改变，已停止操作。请回到原来的浏览器再启动。");
+                throw new Stop("B02", "当前窗口已改变，已停止操作。请回到原窗口再启动。");
+        }
+        public string ExternalSelection()
+        {
+            Program.Stage("读取原应用文字选区"); Guard();
+            try
+            {
+                var focused=AutomationElement.FocusedElement;
+                if(focused==null || !Under(focused,root)) throw new Stop("B02","无法确认原应用焦点，请回到原窗口再调用。");
+                if(focused.Current.IsPassword) return null;
+                for(int i=0;focused!=null && i<24;i++,focused=TreeWalker.ControlViewWalker.GetParent(focused))
+                {
+                    object pattern;
+                    if(focused.TryGetCurrentPattern(TextPattern.Pattern,out pattern))
+                    {
+                        var text=(TextPattern)pattern;
+                        if(text.SupportedTextSelection!=SupportedTextSelection.None)
+                        {
+                            var selected=new StringBuilder();
+                            foreach(var range in text.GetSelection())
+                            {
+                                string part=range.GetText(30001-selected.Length);
+                                if(part.Length==0) continue;
+                                if(selected.Length>0) selected.Append(Environment.NewLine);
+                                selected.Append(part);
+                                if(selected.Length>30000) break;
+                            }
+                            Guard();
+                            return selected.Length==0 ? null : Rules.ValidateInput(selected.ToString());
+                        }
+                    }
+                    if(Automation.Compare(focused,root)) break;
+                }
+            }
+            catch(ElementNotAvailableException) { Guard(); }
+            catch(InvalidOperationException) { Guard(); }
+            // Unknown apps may use Ctrl+C for commands or copy a whole line with
+            // no selection. Preserve the clipboard instead of injecting that chord.
+            Program.Stage("原应用未提供文字选区，使用剪贴板");
+            return null;
         }
         public bool? HasSelection()
         {
@@ -1197,11 +1401,12 @@ namespace DeepSeekBridge
             if (refreshed == null) throw new Stop("L01", "分屏调整后无法重新确认 DeepSeek，未粘贴或发送。");
             return refreshed;
         }
-        public void Run(string text, Action markAttempt)
+        public void Run(string text, Action markAttempt, bool directOnly=false)
         {
             Program.Stage("确认 DeepSeek 网页");
             AutomationElement doc = null;
-            if (IsStandaloneBlank()) NavigateBlankPage();
+            if(directOnly) Program.Stage("等待默认浏览器中的 DeepSeek 页面");
+            else if (IsStandaloneBlank()) NavigateBlankPage();
             else
             {
                 doc = Destination();
@@ -1268,6 +1473,56 @@ namespace DeepSeekBridge
 
     static class Native
     {
+        delegate bool EnumWindowCallback(IntPtr hwnd,IntPtr data);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowCallback callback,IntPtr data);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hwnd,int command);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] internal static extern bool AllowSetForegroundWindow(uint pid);
+        [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint thread,uint other,bool attach);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd,StringBuilder value,int count);
+        [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd,StringBuilder value,int count);
+        internal static string WindowTitle(IntPtr hwnd)
+        { var title=new StringBuilder(1024); GetWindowText(hwnd,title,title.Capacity); return title.ToString(); }
+        internal static List<IntPtr> TopBrowserWindows()
+        {
+            var found=new List<IntPtr>();
+            EnumWindows(delegate(IntPtr hwnd,IntPtr unused) {
+                if(!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return true;
+                var name=new StringBuilder(128); GetClassName(hwnd,name,name.Capacity);
+                if(name.ToString()=="Chrome_WidgetWin_1") found.Add(hwnd);
+                return true;
+            },IntPtr.Zero);
+            return found;
+        }
+        internal static void ActivateBrowser(IntPtr hwnd,uint expectedPid)
+        {
+            uint pid; uint targetThread=GetWindowThreadProcessId(hwnd,out pid);
+            if(!IsWindow(hwnd) || pid!=expectedPid) return;
+            if(IsIconic(hwnd)) ShowWindowAsync(hwnd,9); // SW_RESTORE; preserve normal/maximized layout otherwise.
+            AllowSetForegroundWindow(expectedPid);
+            SetForegroundWindow(hwnd);
+            if(GetForegroundWindow()==hwnd) return;
+            uint currentThread=GetCurrentThreadId(), foregroundPid;
+            uint foregroundThread=GetWindowThreadProcessId(GetForegroundWindow(),out foregroundPid);
+            bool attachedForeground=false,attachedTarget=false;
+            try
+            {
+                if(foregroundThread!=0 && foregroundThread!=currentThread)
+                    attachedForeground=AttachThreadInput(currentThread,foregroundThread,true);
+                if(targetThread!=0 && targetThread!=currentThread && targetThread!=foregroundThread)
+                    attachedTarget=AttachThreadInput(currentThread,targetThread,true);
+                BringWindowToTop(hwnd); SetForegroundWindow(hwnd);
+            }
+            finally
+            {
+                if(attachedTarget) AttachThreadInput(currentThread,targetThread,false);
+                if(attachedForeground) AttachThreadInput(currentThread,foregroundThread,false);
+            }
+        }
         [DllImport("user32.dll")] internal static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
