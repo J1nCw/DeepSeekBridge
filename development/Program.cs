@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.13.0")]
-[assembly: AssemblyFileVersion("1.1.13.0")]
+[assembly: AssemblyVersion("1.1.14.0")]
+[assembly: AssemblyFileVersion("1.1.14.0")]
 
 namespace DeepSeekBridge
 {
@@ -193,6 +193,16 @@ namespace DeepSeekBridge
     // unchanged contents and focus loss without touching the real clipboard.
     static class QueryInput
     {
+        internal static string ReadClipboard(Action guard,Func<uint> sequence,Func<string> read,Action<int> pause)
+        {
+            // External applications never supply a selection probe or copy action.
+            try { return Read(guard,sequence,read,delegate { throw new InvalidOperationException("Clipboard-only path must not copy."); },false,pause); }
+            catch(Stop e)
+            {
+                if(e.Code=="C01") throw new Stop("C01","剪贴板中没有可查询的文字。请先在原应用中手动复制，再调用；其他应用的选区不会被读取。");
+                throw;
+            }
+        }
         internal static string Read(Action guard, Func<uint> sequence, Func<string> read,
             Action copy, bool? hasSelection, Action<int> pause)
         {
@@ -267,6 +277,11 @@ namespace DeepSeekBridge
         { try { action(); return false; } catch(Stop e) { return e.Code==code; } }
         internal static void Tests(Dictionary<string,bool> checks)
         {
+            int reads=0,delays=0;
+            checks.Add("external-clipboard-only-no-copy",ReadClipboard(delegate {},delegate { return 5u; },delegate { reads++; return "saved text"; },delegate(int ms) { delays++; })=="saved text" && reads==1 && delays==0);
+            reads=0;
+            checks.Add("external-clipboard-lock-retry",ReadClipboard(delegate {},delegate { return 5u; },delegate { if(++reads==1) throw new ExternalException(); return "saved text"; },delegate(int ms) {})=="saved text" && reads==2);
+            checks.Add("external-empty-clipboard-no-selection-probe",Stops(delegate { ReadClipboard(delegate {},delegate { return 5u; },delegate { return null; },delegate(int ms) {}); },"C01"));
             var p=new Probe();
             checks.Add("input-selection-priority",p.Run(true)=="selection" && p.Copies==1);
             p=new Probe();
@@ -455,7 +470,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.13 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.14 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -486,7 +501,7 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.13" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.14" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     if(source==IntPtr.Zero || pid==0) throw new Stop("B01","未能确认当前窗口，请回到要查询的应用后再调用。");
@@ -506,23 +521,31 @@ namespace DeepSeekBridge
                         catch { }
                         Environment.Exit(2);
                     }, null, 10000, Timeout.Infinite);
-                    var session = new Session(source, (int)pid, browser);
-                    session.Guard();
-                    if(!StartupWait.Released(Native.LaunchKeysHeld,session.Guard,Thread.Sleep))
+                    Action guardSource=delegate { Native.GuardWindow(source,pid); };
+                    guardSource();
+                    if(!StartupWait.Released(Native.LaunchKeysHeld,guardSource,Thread.Sleep))
                         throw new Stop("I02","启动按键仍未松开，请松开后再调用。");
                     string expectedBrowser=external ? DefaultBrowser.ResolvePath() : null;
-                    string selection=external ? session.ExternalSelection() : null;
-                    string text = QueryInput.Read(session.Guard, Native.GetClipboardSequenceNumber,
-                        delegate { return Clipboard.ContainsText(TextDataFormat.UnicodeText) ? Clipboard.GetText(TextDataFormat.UnicodeText) : null; },
-                        delegate {
-                            session.Guard();
-                            if(external) CopyExternalSelection(selection,session.Guard);
-                            else Native.Chord(17,67);
-                        }, external ? (bool?)(selection!=null) : session.HasSelection(), Thread.Sleep);
+                    Func<string> readClipboard=delegate { return Clipboard.ContainsText(TextDataFormat.UnicodeText) ? Clipboard.GetText(TextDataFormat.UnicodeText) : null; };
+                    Session session=null;
+                    string text;
+                    if(external)
+                    {
+                        // Do not create a UIA root or inspect focus/selection in
+                        // the source app, including terminals and desktop windows.
+                        Stage("跨应用入口：仅读取剪贴板");
+                        text=QueryInput.ReadClipboard(guardSource,Native.GetClipboardSequenceNumber,readClipboard,Thread.Sleep);
+                    }
+                    else
+                    {
+                        session=new Session(source,(int)pid,browser);
+                        text=QueryInput.Read(session.Guard,Native.GetClipboardSequenceNumber,readClipboard,
+                            delegate { session.Guard(); Native.Chord(17,67); },session.HasSelection(),Thread.Sleep);
+                    }
                     string fingerprint = Rules.Fingerprint(text);
                     string recent = Path.Combine(DataDir, "recent.txt");
                     CheckRecent(recent, source, fingerprint);
-                    if(external) session=DefaultBrowser.Open(expectedBrowser,session.Guard);
+                    if(external) session=DefaultBrowser.Open(expectedBrowser,guardSource);
                     session.Run(text, delegate
                     {
                         Directory.CreateDirectory(DataDir);
@@ -544,17 +567,6 @@ namespace DeepSeekBridge
             MessageBox.Show(message + "\n\n代码：" + code + "\n阶段：" + atStage,
                 "DeepSeekBridge · 操作未完成",MessageBoxButtons.OK,MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button1,MessageBoxOptions.DefaultDesktopOnly);
-        }
-        static void CopyExternalSelection(string selection,Action guard)
-        {
-            Rules.ValidateInput(selection);
-            for(int i=0;i<4;i++)
-            {
-                guard();
-                try { Clipboard.SetText(selection,TextDataFormat.UnicodeText); return; }
-                catch(ExternalException) { if(i<3) Thread.Sleep(30); }
-            }
-            throw new Stop("C05","无法将当前选区复制到剪贴板，请稍后重试。");
         }
         static void EndWatchdog() { Interlocked.Exchange(ref done, 1); if (watchdog != null) watchdog.Dispose(); }
         static void CheckRecent(string path, IntPtr hwnd, string fingerprint)
@@ -700,48 +712,7 @@ namespace DeepSeekBridge
         public Session(IntPtr handle, int process, string name) { hwnd = handle; pid = process; browser = name; root = AutomationElement.FromHandle(handle); }
         public void Guard()
         {
-            uint currentPid; Native.GetWindowThreadProcessId(hwnd, out currentPid);
-            if (Native.GetForegroundWindow() != hwnd || currentPid != pid || !Native.IsWindow(hwnd))
-                throw new Stop("B02", "当前窗口已改变，已停止操作。请回到原窗口再启动。");
-        }
-        public string ExternalSelection()
-        {
-            Program.Stage("读取原应用文字选区"); Guard();
-            try
-            {
-                var focused=AutomationElement.FocusedElement;
-                if(focused==null || !Under(focused,root)) throw new Stop("B02","无法确认原应用焦点，请回到原窗口再调用。");
-                if(focused.Current.IsPassword) return null;
-                for(int i=0;focused!=null && i<24;i++,focused=TreeWalker.ControlViewWalker.GetParent(focused))
-                {
-                    object pattern;
-                    if(focused.TryGetCurrentPattern(TextPattern.Pattern,out pattern))
-                    {
-                        var text=(TextPattern)pattern;
-                        if(text.SupportedTextSelection!=SupportedTextSelection.None)
-                        {
-                            var selected=new StringBuilder();
-                            foreach(var range in text.GetSelection())
-                            {
-                                string part=range.GetText(30001-selected.Length);
-                                if(part.Length==0) continue;
-                                if(selected.Length>0) selected.Append(Environment.NewLine);
-                                selected.Append(part);
-                                if(selected.Length>30000) break;
-                            }
-                            Guard();
-                            return selected.Length==0 ? null : Rules.ValidateInput(selected.ToString());
-                        }
-                    }
-                    if(Automation.Compare(focused,root)) break;
-                }
-            }
-            catch(ElementNotAvailableException) { Guard(); }
-            catch(InvalidOperationException) { Guard(); }
-            // Unknown apps may use Ctrl+C for commands or copy a whole line with
-            // no selection. Preserve the clipboard instead of injecting that chord.
-            Program.Stage("原应用未提供文字选区，使用剪贴板");
-            return null;
+            Native.GuardWindow(hwnd,(uint)pid);
         }
         public bool? HasSelection()
         {
@@ -1473,6 +1444,12 @@ namespace DeepSeekBridge
 
     static class Native
     {
+        internal static void GuardWindow(IntPtr hwnd,uint pid)
+        {
+            uint currentPid; GetWindowThreadProcessId(hwnd,out currentPid);
+            if(GetForegroundWindow()!=hwnd || currentPid!=pid || !IsWindow(hwnd))
+                throw new Stop("B02","当前窗口已改变，已停止操作。请回到原窗口再启动。");
+        }
         delegate bool EnumWindowCallback(IntPtr hwnd,IntPtr data);
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowCallback callback,IntPtr data);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
