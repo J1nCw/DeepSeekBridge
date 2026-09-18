@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.14.0")]
-[assembly: AssemblyFileVersion("1.1.14.0")]
+[assembly: AssemblyVersion("1.1.16.0")]
+[assembly: AssemblyFileVersion("1.1.16.0")]
 
 namespace DeepSeekBridge
 {
@@ -382,6 +382,24 @@ namespace DeepSeekBridge
             if(added.Count==1) return added[0];
             return after.Count==1 ? after[0] : null;
         }
+        internal static BrowserWindow ChooseCurrentWindow(List<BrowserWindow> windows,IntPtr top,Func<IntPtr,IntPtr> next)
+        {
+            // Use native Z order, not titles or a search through background tabs.
+            // Bound the walk and reject cycles if windows change during traversal.
+            var seen=new HashSet<IntPtr>();
+            for(var hwnd=top;hwnd!=IntPtr.Zero && seen.Count<1024 && seen.Add(hwnd);hwnd=next(hwnd))
+            {
+                var match=windows.FirstOrDefault(w=>w.Handle==hwnd);
+                if(match!=null) return match;
+            }
+            return null;
+        }
+        internal static T ReuseOrOpen<T>(T current,Func<T,bool> isDestination,Func<T,bool> navigateBlank,Func<T> open) where T:class
+        {
+            // Probe failures must stop, not silently open another conversation.
+            if(current!=null && (isDestination(current) || navigateBlank(current))) return current;
+            return open();
+        }
         internal static void Tests(Dictionary<string,bool> checks)
         {
             var empty=new List<BrowserWindow>();
@@ -400,8 +418,70 @@ namespace DeepSeekBridge
             checks.Add("activate-two-deepseek-changes-ambiguous",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{changed,changedB})==null);
             var reused=new BrowserWindow {Handle=a.Handle,Pid=20,Title="New browser"};
             checks.Add("activate-reused-handle-new-process",ChooseWindow(new List<BrowserWindow>{a,b},new List<BrowserWindow>{reused,b})==reused);
+            var order=new Dictionary<IntPtr,IntPtr>{{new IntPtr(99),b.Handle},{b.Handle,a.Handle},{a.Handle,IntPtr.Zero}};
+            checks.Add("reuse-frontmost-default-window",ChooseCurrentWindow(new List<BrowserWindow>{a,b},new IntPtr(99),h=>order[h])==b);
+            checks.Add("reuse-no-title-based-window-switch",ChooseCurrentWindow(new List<BrowserWindow>{changed,b},new IntPtr(99),h=>order[h])==b);
+            checks.Add("reuse-no-window",ChooseCurrentWindow(empty,IntPtr.Zero,h=>IntPtr.Zero)==null);
+            checks.Add("reuse-window-order-cycle-bounded",ChooseCurrentWindow(new List<BrowserWindow>{a},new IntPtr(99),h=>h)==null);
+            int walks=0;
+            checks.Add("reuse-window-order-walk-bounded",ChooseCurrentWindow(empty,new IntPtr(100),h=>{walks++;return new IntPtr(h.ToInt64()+1);})==null && walks==1024);
+            int opens=0,probes=0;
+            Func<BrowserWindow> open=delegate { opens++; return added; };
+            int blanks=0;
+            Func<BrowserWindow,bool> notBlank=delegate(BrowserWindow w) { blanks++; return false; };
+            checks.Add("reuse-chat-does-not-open-url",ReuseOrOpen(a,w=>{probes++;return true;},notBlank,open)==a && opens==0 && probes==1 && blanks==0);
+            probes=0;
+            checks.Add("reuse-normal-page-opens-once",ReuseOrOpen(a,w=>{probes++;return false;},notBlank,open)==added && opens==1 && probes==1 && blanks==1);
+            opens=0; probes=0; blanks=0;
+            checks.Add("reuse-cold-start-skips-probe",ReuseOrOpen<BrowserWindow>(null,w=>{probes++;return true;},notBlank,open)==added && opens==1 && probes==0 && blanks==0);
+            opens=0; bool stopped=false;
+            try { ReuseOrOpen(a,delegate(BrowserWindow w) { throw new Stop("B02","test"); },notBlank,open); }
+            catch(Stop e) { stopped=e.Code=="B02"; }
+            checks.Add("reuse-probe-error-does-not-open-url",stopped && opens==0);
+            opens=0; blanks=0;
+            checks.Add("reuse-blank-navigates-current-window-once",ReuseOrOpen(a,w=>false,w=>{blanks++;return true;},open)==a && blanks==1 && opens==0);
+            foreach(string code in new[]{"N01","S11","B02"})
+            {
+                opens=0; stopped=false;
+                try { ReuseOrOpen(a,w=>false,delegate(BrowserWindow w) { throw new Stop(code,"test"); },open); }
+                catch(Stop e) { stopped=e.Code==code; }
+                checks.Add("reuse-blank-failure-no-new-page-"+code,stopped && opens==0);
+            }
         }
         internal static Session Open(string expected,Action guardSource)
+        {
+            guardSource();
+            var windows=Windows(expected);
+            var candidate=ChooseCurrentWindow(windows,Native.GetTopWindow(IntPtr.Zero),h=>Native.GetWindow(h,2));
+            Session current=null;
+            if(candidate!=null)
+            {
+                Program.Stage("检查默认浏览器当前页面能否复用");
+                for(int i=0;i<10;i++)
+                {
+                    if(Native.GetForegroundWindow()==candidate.Handle)
+                    {
+                        Native.GuardWindow(candidate.Handle,candidate.Pid);
+                        current=new Session(candidate.Handle,(int)candidate.Pid,Path.GetFileNameWithoutExtension(expected).ToLowerInvariant());
+                        break;
+                    }
+                    guardSource();
+                    if(i%3==0 && i<9) Native.ActivateBrowser(candidate.Handle,candidate.Pid);
+                    Thread.Sleep(80);
+                }
+                if(current==null) throw new Stop("B05","未能激活默认浏览器以检查当前页面，请单击目标浏览器后重试。本次没有新建页面或发送文字。");
+            }
+            return ReuseOrOpen(current,delegate(Session s) {
+                bool reuse=s.IsCurrentDeepSeekPage();
+                if(reuse) Program.Stage("复用默认浏览器当前 DeepSeek 对话");
+                return reuse;
+            },s=>s.TryNavigateStandaloneBlank(),delegate {
+                // Our own activation changed the foreground from the source app.
+                // Guard that browser during fallback instead of the old source.
+                return OpenNew(expected,current==null ? guardSource : (Action)current.Guard);
+            });
+        }
+        static Session OpenNew(string expected,Action guardSource)
         {
             guardSource();
             IntPtr sourceWindow=Native.GetForegroundWindow();
@@ -470,7 +550,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.14 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.16 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -501,7 +581,7 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.14" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.16" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     if(source==IntPtr.Zero || pid==0) throw new Stop("B01","未能确认当前窗口，请回到要查询的应用后再调用。");
@@ -879,6 +959,24 @@ namespace DeepSeekBridge
                 } catch(ElementNotAvailableException) { return false; }
             }).ToList();
         }
+        internal bool IsCurrentDeepSeekPage()
+        {
+            for(int retry=0;retry<2;retry++)
+            {
+                Guard(); InvalidateEdge();
+                try
+                {
+                    // A verified DeepSeek page is reused even if its editor is
+                    // still loading, has a draft, or is generating a response.
+                    // Run performs the existing readiness/draft/busy checks.
+                    bool verified=Documents().Any(d=>Rules.IsDestination(DocumentUrl(d)));
+                    if(!verified) verified=Destination()!=null;
+                    Guard(); return verified;
+                }
+                catch(ElementNotAvailableException) { Thread.Sleep(80); }
+            }
+            throw new Stop("U11","浏览器页面正在切换，无法确认是否复用当前对话。请等页面稳定后重试，本次没有新建页面。");
+        }
         AutomationElement Destination()
         {
             for(int retry=0;retry<2;retry++)
@@ -987,6 +1085,15 @@ namespace DeepSeekBridge
             if (!Under(address,root) || Documents().Any(d => Under(address,d)) || !IsAddressName(Name(address)))
                 throw new Stop("S06", "新标签页的原生地址栏未能确认，已停止导航。");
             FillFreshAddress(address);
+        }
+        internal bool TryNavigateStandaloneBlank()
+        {
+            Guard();
+            if(!IsStandaloneBlank()) return false;
+            // Reuse the same guarded navigation as the in-browser entry. It
+            // checks the blank page again before writing the native address bar.
+            NavigateBlankPage();
+            return true;
         }
         bool IsStandaloneBlank()
         {
@@ -1452,6 +1559,8 @@ namespace DeepSeekBridge
         }
         delegate bool EnumWindowCallback(IntPtr hwnd,IntPtr data);
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowCallback callback,IntPtr data);
+        [DllImport("user32.dll")] internal static extern IntPtr GetTopWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] internal static extern IntPtr GetWindow(IntPtr hwnd,uint command);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
         [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hwnd,int command);
