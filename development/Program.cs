@@ -15,8 +15,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: AssemblyTitle("DeepSeekBridge")]
 [assembly: AssemblyDescription("Selected text to DeepSeek browser companion")]
-[assembly: AssemblyVersion("1.1.16.0")]
-[assembly: AssemblyFileVersion("1.1.16.0")]
+[assembly: AssemblyVersion("1.1.18.0")]
+[assembly: AssemblyFileVersion("1.1.18.0")]
 
 namespace DeepSeekBridge
 {
@@ -189,10 +189,115 @@ namespace DeepSeekBridge
         }
     }
 
+    sealed class PickerSources
+    {
+        internal sealed class Document
+        {
+            internal string Id, Url;
+            internal bool Internal;
+            internal System.Windows.Rect Bounds;
+        }
+        readonly HashSet<string> ids=new HashSet<string>();
+        readonly HashSet<string> urls=new HashSet<string>(StringComparer.Ordinal);
+        internal PickerSources(IEnumerable<Document> documents)
+        {
+            foreach(var doc in documents.Where(d=>!d.Internal))
+            {
+                if(!String.IsNullOrEmpty(doc.Id)) ids.Add(doc.Id);
+                if(!String.IsNullOrEmpty(doc.Url)) urls.Add(doc.Url);
+            }
+        }
+        internal bool IsSource(Document doc,bool createdRightPane,System.Windows.Rect window)
+        {
+            if((!String.IsNullOrEmpty(doc.Id) && ids.Contains(doc.Id)) ||
+                (!String.IsNullOrEmpty(doc.Url) && urls.Contains(doc.Url))) return true;
+            if(doc.Internal) return false;
+            // Only our newly created right pane may contain an unfamiliar picker.
+            // Existing split pages remain protected even if their URL is missing.
+            if(!createdRightPane || doc.Bounds.IsEmpty || window.IsEmpty ||
+                doc.Bounds.Width<=0 || window.Width<=0) return true;
+            // Recreated/URL-less source documents on the left stay protected.
+            return doc.Bounds.Left<=window.Left+window.Width*0.40;
+        }
+        internal static void Tests(Dictionary<string,bool> checks)
+        {
+            var window=new System.Windows.Rect(0,0,1200,900);
+            var left=new System.Windows.Rect(0,100,600,800);
+            var right=new System.Windows.Rect(610,100,590,800);
+            var captured=new PickerSources(new[]{new Document {Id="source-1",Url="file:///C:/fixture.pdf",Bounds=window}});
+            checks.Add("picker-original-id-protected",captured.IsSource(new Document {Id="source-1",Bounds=left},true,window));
+            checks.Add("picker-recreated-source-url-protected",captured.IsSource(new Document {Id="source-2",Url="file:///C:/fixture.pdf",Bounds=left},true,window));
+            checks.Add("picker-unknown-left-source-protected",captured.IsSource(new Document {Id="source-3",Bounds=left},true,window));
+            checks.Add("picker-new-right-empty-url-not-source",!captured.IsSource(new Document {Id="picker",Url="",Bounds=right},true,window));
+            checks.Add("picker-new-right-online-ntp-not-source",!captured.IsSource(new Document {Id="picker",Url="https://ntp.msn.com/edge/ntp",Bounds=right},true,window));
+            checks.Add("picker-internal-document-not-source",!captured.IsSource(new Document {Id="picker",Internal=true,Bounds=right},false,window));
+            checks.Add("picker-existing-right-page-protected",captured.IsSource(new Document {Id="other",Url="https://example.com",Bounds=right},false,window));
+            checks.Add("picker-existing-unknown-right-protected",captured.IsSource(new Document {Id="other",Bounds=right},false,window));
+            checks.Add("picker-source-url-on-right-still-protected",captured.IsSource(new Document {Id="other",Url="file:///C:/fixture.pdf",Bounds=right},true,window));
+            checks.Add("picker-missing-bounds-protected",captured.IsSource(new Document {Id="unknown",Bounds=System.Windows.Rect.Empty},true,window));
+        }
+    }
+
+    static class UiRead
+    {
+        internal static bool Transient(Exception error)
+        {
+            if(error is ElementNotAvailableException) return true;
+            var com=error as COMException;
+            if(com==null) return false;
+            uint code=unchecked((uint)com.ErrorCode);
+            return code==0x80040201 || code==0x80010108 || code==0x8001010A || code==0x80010001;
+        }
+        // Only pass discovery/read operations here, never navigation or sending.
+        internal static T Retry<T>(Func<T> read,Action guard,Action refresh,Action<int> pause)
+        {
+            for(int attempt=0;attempt<3;attempt++)
+            {
+                guard();
+                try { T result=read(); guard(); return result; }
+                catch(Exception e)
+                {
+                    if(!Transient(e)) throw;
+                    guard();
+                    if(attempt==2) throw new Stop("U13","浏览器界面控件持续刷新，暂时无法稳定读取。已停止操作，请稍后重试。");
+                    pause(80); guard(); refresh();
+                }
+            }
+            throw new InvalidOperationException();
+        }
+        internal static void Tests(Dictionary<string,bool> checks)
+        {
+            int reads=0,refreshes=0,waits=0;
+            int result=Retry(delegate { if(++reads<3) throw new COMException("test",unchecked((int)0x80040201)); return 7; },delegate {},delegate {refreshes++;},delegate(int ms) {waits+=ms;});
+            checks.Add("uia-stale-read-reacquires-and-recovers",result==7 && reads==3 && refreshes==2 && waits==160);
+            reads=0; bool stopped=false;
+            try { Retry<int>(delegate {reads++;throw new ElementNotAvailableException();},delegate {},delegate {},delegate(int ms) {}); }
+            catch(Stop e) {stopped=e.Code=="U13";}
+            checks.Add("uia-persistent-stale-read-bounded",stopped && reads==3);
+            reads=0; stopped=false;
+            try { Retry<int>(delegate {reads++;throw new COMException("test",unchecked((int)0x80070005));},delegate {},delegate {},delegate(int ms) {}); }
+            catch(COMException) {stopped=true;}
+            checks.Add("uia-unknown-com-not-retried",stopped && reads==1);
+            reads=0; stopped=false; bool switched=false;
+            try { Retry<int>(delegate {reads++;throw new ElementNotAvailableException();},delegate {if(switched) throw new Stop("B02","test");},delegate {},delegate(int ms) {switched=true;}); }
+            catch(Stop e) {stopped=e.Code=="B02";}
+            checks.Add("uia-focus-loss-cancels-read-retry",stopped && reads==1);
+            checks.Add("uia-provider-busy-classified",Transient(new COMException("test",unchecked((int)0x8001010A))));
+            checks.Add("uia-stop-not-retried",!Transient(new Stop("D02","test")));
+        }
+    }
+
     // Dependencies allow offline tests of selection priority, clipboard contention,
     // unchanged contents and focus loss without touching the real clipboard.
     static class QueryInput
     {
+        internal static bool? BrowserHint(string browser,bool address,bool? reported)
+        {
+            if(address) return false;
+            // Edge can expose an empty TextPattern selection while its web/PDF
+            // renderer still holds a selection. Only positive evidence is final.
+            return browser=="msedge" && reported==false ? (bool?)null : reported;
+        }
         internal static string ReadClipboard(Action guard,Func<uint> sequence,Func<string> read,Action<int> pause)
         {
             // External applications never supply a selection probe or copy action.
@@ -283,6 +388,16 @@ namespace DeepSeekBridge
             checks.Add("external-clipboard-lock-retry",ReadClipboard(delegate {},delegate { return 5u; },delegate { if(++reads==1) throw new ExternalException(); return "saved text"; },delegate(int ms) {})=="saved text" && reads==2);
             checks.Add("external-empty-clipboard-no-selection-probe",Stops(delegate { ReadClipboard(delegate {},delegate { return 5u; },delegate { return null; },delegate(int ms) {}); },"C01"));
             var p=new Probe();
+            checks.Add("edge-empty-uia-still-copies-selection",p.Run(BrowserHint("msedge",false,false))=="selection" && p.Copies==1);
+            p=new Probe {CopiesWork=false};
+            checks.Add("edge-empty-uia-no-selection-keeps-clipboard",p.Run(BrowserHint("msedge",false,false))=="clipboard" && p.Copies==1);
+            p=new Probe();
+            checks.Add("edge-address-selection-never-copied",p.Run(BrowserHint("msedge",true,true))=="clipboard" && p.Copies==0);
+            p=new Probe {CopiesWork=false};
+            checks.Add("edge-positive-selection-failure-no-old-text",Stops(delegate {p.Run(BrowserHint("msedge",false,true));},"C01"));
+            p=new Probe();
+            checks.Add("chrome-empty-selection-policy-unchanged",p.Run(BrowserHint("chrome",false,false))=="clipboard" && p.Copies==0);
+            p=new Probe();
             checks.Add("input-selection-priority",p.Run(true)=="selection" && p.Copies==1);
             p=new Probe();
             checks.Add("input-no-selection-clipboard",p.Run(false)=="clipboard" && p.Copies==0 && p.Pauses==0);
@@ -550,7 +665,7 @@ namespace DeepSeekBridge
                 using(var process = Process.GetCurrentProcess())
                 {
                     Directory.CreateDirectory(DataDir);
-                    string metrics = "version=1.1.16 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
+                    string metrics = "version=1.1.18 elapsed_ms=" + lifetime.ElapsedMilliseconds + " cpu_ms=" + Math.Round(process.TotalProcessorTime.TotalMilliseconds) +
                         " peak_working_set_mb=" + Math.Round(process.PeakWorkingSet64/1048576.0,1) +
                         " edge_scan_count="+edgeScanCount+" edge_scan_ms="+Interlocked.Read(ref edgeScanMilliseconds);
                     string timings; lock(steps) { timings=String.Join(" | ",steps.ToArray()); }
@@ -581,7 +696,7 @@ namespace DeepSeekBridge
                 try
                 {
                     PortableStorage.EnsureWritable(DataDir);
-                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.16" + Environment.NewLine, Encoding.UTF8);
+                    if(DiagnosticsEnabled) File.WriteAllText(Path.Combine(DataDir, "trace.txt"), "DeepSeekBridge 1.1.18" + Environment.NewLine, Encoding.UTF8);
                     uint pid;
                     Native.GetWindowThreadProcessId(source, out pid);
                     if(source==IntPtr.Zero || pid==0) throw new Stop("B01","未能确认当前窗口，请回到要查询的应用后再调用。");
@@ -619,8 +734,10 @@ namespace DeepSeekBridge
                     else
                     {
                         session=new Session(source,(int)pid,browser);
+                        bool? selected=session.HasSelection();
+                        Stage("浏览器选区判断："+(selected==true ? "已确认选区" : selected==false ? "无需复制" : "未确认，尝试原生复制"));
                         text=QueryInput.Read(session.Guard,Native.GetClipboardSequenceNumber,readClipboard,
-                            delegate { session.Guard(); Native.Chord(17,67); },session.HasSelection(),Thread.Sleep);
+                            delegate { session.Guard(); Native.Chord(17,67); },selected,Thread.Sleep);
                     }
                     string fingerprint = Rules.Fingerprint(text);
                     string recent = Path.Combine(DataDir, "recent.txt");
@@ -635,7 +752,7 @@ namespace DeepSeekBridge
                     Status("SENT_ACKNOWLEDGED");
                 }
                 catch (Stop e) { EndWatchdog(); Status(e.Code); failureCode=e.Code; failureMessage=e.Message; Environment.ExitCode=1; }
-                catch (Exception e) { EndWatchdog(); failureCode="ERROR_" + e.GetType().Name; Status(failureCode); failureMessage="本次操作已停止。请检查 DeepSeek 中是否已经填入或发送文字，再决定是否重试。"; Environment.ExitCode=2; }
+                catch (Exception e) { EndWatchdog(); failureCode="ERROR_" + e.GetType().Name+(e is COMException ? "_"+((COMException)e).ErrorCode.ToString("X8") : ""); Status(failureCode); failureMessage="本次操作已停止。请检查 DeepSeek 中是否已经填入或发送文字，再决定是否重试。"; Environment.ExitCode=2; }
             }
             // Automation is finished and the mutex is released before displaying an error.
             if(failureCode!=null) { ShowError(failureCode,failureMessage,stage); return; }
@@ -746,6 +863,8 @@ namespace DeepSeekBridge
                 {"reject-stacked-documents", !Rules.SideBySide(new System.Windows.Rect(0,100,800,700),new System.Windows.Rect(808,850,400,700))}
             };
             DefaultBrowser.Tests(checks);
+            UiRead.Tests(checks);
+            PickerSources.Tests(checks);
             StartupWait.Tests(checks);
             QueryInput.Tests(checks);
             Maintenance.Tests(checks);
@@ -779,6 +898,7 @@ namespace DeepSeekBridge
         readonly int pid;
         readonly string browser;
         bool createdSplitThisRun;
+        PickerSources pickerSources;
         sealed class EdgeNode
         {
             internal AutomationElement Element;
@@ -811,13 +931,20 @@ namespace DeepSeekBridge
                     {
                         var text = (TextPattern)pattern;
                         if (text.SupportedTextSelection != SupportedTextSelection.None)
-                            return text.GetSelection().Any(range => range.GetText(1).Length > 0);
+                        {
+                            bool selected=text.GetSelection().Any(range => range.GetText(1).Length > 0);
+                            bool? hint=QueryInput.BrowserHint(browser,false,selected);
+                            if(hint.HasValue) { Guard(); return hint; }
+                            // An empty child provider must not hide a parent's
+                            // selection. Keep walking in Edge, then try Ctrl+C.
+                        }
                     }
                     node=TreeWalker.ControlViewWalker.GetParent(node);
                 }
             }
             catch (ElementNotAvailableException) { Guard(); }
             catch (InvalidOperationException) { Guard(); }
+            catch (COMException) { Guard(); }
             // PDF providers may not expose selection. Use the native copy path.
             return null;
         }
@@ -843,6 +970,7 @@ namespace DeepSeekBridge
             return parent.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, type)).Cast<AutomationElement>().Where(Visible).ToList();
         }
         void InvalidateEdge() { edgeNodes=null; edgeAge=null; }
+        void RefreshRoot() { Guard(); InvalidateEdge(); root=AutomationElement.FromHandle(hwnd); }
         List<EdgeNode> EdgeSnapshot()
         {
             if(edgeNodes!=null && edgeAge!=null && edgeAge.ElapsedMilliseconds<100) return edgeNodes;
@@ -979,6 +1107,7 @@ namespace DeepSeekBridge
         }
         AutomationElement Destination()
         {
+            if(browser=="msedge") return UiRead.Retry(DestinationSnapshot,Guard,RefreshRoot,Thread.Sleep);
             for(int retry=0;retry<2;retry++)
             {
                 Guard();
@@ -1328,19 +1457,51 @@ namespace DeepSeekBridge
             }
             return result;
         }
+        sealed class PickerSnapshot
+        {
+            internal System.Windows.Rect Bounds;
+            internal List<AutomationElement> Edits, Fresh;
+            internal int SourceCount;
+        }
+        static PickerSources.Document PickerDocument(AutomationElement document)
+        {
+            return new PickerSources.Document {
+                Id=String.Join(".",document.GetRuntimeId().Select(x=>x.ToString()).ToArray()),
+                Url=DocumentUrl(document), Internal=IsInternalPicker(document), Bounds=document.Current.BoundingRectangle
+            };
+        }
+        PickerSources CapturePickerSources()
+        {
+            InvalidateEdge();
+            return new PickerSources(Documents().Select(PickerDocument).ToList());
+        }
+        PickerSnapshot ReadPicker()
+        {
+            var bounds=root.Current.BoundingRectangle;
+            if(pickerSources==null) throw new Stop("S12","未记录分屏前的来源页面，已停止网址输入。");
+            // Refresh UIA objects without redefining which pages were sources.
+            var sources=Documents().Where(d=>pickerSources.IsSource(PickerDocument(d),createdSplitThisRun,bounds)).ToList();
+            var edits=PickerControls(ControlType.Edit,sources).Where(e=>IsAddressName(Name(e)) &&
+                e.Current.BoundingRectangle.Left>bounds.Left+bounds.Width*0.40 &&
+                !sources.Any(d=>Under(e,d)) && String.IsNullOrWhiteSpace(Value(e))).ToList();
+            var fresh=new List<AutomationElement>();
+            if(edits.Count!=1)
+                fresh=PickerControls(ControlType.Button,sources).Concat(PickerControls(ControlType.ListItem,sources)).Concat(PickerControls(ControlType.Hyperlink,sources)).Where(e=>Rules.Named(Name(e),"新建标签页","新标签页","New tab","Open a new tab","打开新标签页") &&
+                    e.Current.BoundingRectangle.Left>bounds.Left+bounds.Width*0.40 &&
+                    e.Current.BoundingRectangle.Top>bounds.Top+110 && !sources.Any(d=>Under(e,d))).ToList();
+            return new PickerSnapshot {Bounds=bounds,Edits=edits,Fresh=fresh,SourceCount=sources.Count};
+        }
         void TryOpenSplit()
         {
             Program.Stage("查找原生分屏入口");
             // Do not toggle an existing split or act on similarly named webpage controls.
-            var originalDocs = Documents().Where(d => !IsInternalPicker(d)).ToList();
             bool alreadySplit = Pair() != null;
             if (!alreadySplit && browser == "chrome") { OpenChromeSplit(); return; }
+            if(alreadySplit) pickerSources=UiRead.Retry(CapturePickerSources,Guard,RefreshRoot,Thread.Sleep);
             if (!alreadySplit)
             {
                 if(browser=="msedge") PrepareEdgeTab();
-                // Switching away and back may destroy the original UIA Document objects.
-                // Exclude source-page fields using a fresh snapshot, not the pre-switch objects.
-                originalDocs=Documents().Where(d=>!IsInternalPicker(d)).ToList();
+                pickerSources=UiRead.Retry(CapturePickerSources,Guard,RefreshRoot,Thread.Sleep);
                 var buttons = NativeControls(ControlType.Button).Where(e => Rules.Named(Name(e), "拆分屏幕", "分屏", "分屏显示", "Split screen", "Split view", "Open split view")).ToList();
                 if (buttons.Count != 1) { TraceControls("no-split-button"); throw new Stop("S01", "没有识别到可安全调用的原生分屏按钮。\n请手动在当前窗口右侧打开 https://chat.deepseek.com，登录后再按鼠标键。\n原文仍在剪贴板中。"); }
                 Invoke(buttons[0]); createdSplitThisRun = true; Thread.Sleep(350);
@@ -1350,26 +1511,25 @@ namespace DeepSeekBridge
             {
                 Guard();
                 if (Destination() != null) return;
-                var bounds = root.Current.BoundingRectangle;
+                var picker=browser=="msedge" ? UiRead.Retry(ReadPicker,Guard,RefreshRoot,Thread.Sleep) : ReadPicker();
+                Program.Stage("右侧入口扫描：来源文档="+picker.SourceCount+" 网址框="+picker.Edits.Count+" 新标签按钮="+picker.Fresh.Count);
+                var bounds = picker.Bounds;
                 // Edge's split picker can be an internal Document, not browser toolbar chrome.
                 // Only target an empty named URL field in the right pane, never a source-page edit.
-                var edits = PickerControls(ControlType.Edit,originalDocs).Where(e => IsAddressName(Name(e)) &&
-                    e.Current.BoundingRectangle.Left > bounds.Left + bounds.Width * 0.40 &&
-                    !originalDocs.Any(d => Under(e,d)) &&
-                    String.IsNullOrWhiteSpace(Value(e))).ToList();
+                var edits = picker.Edits;
                 if (edits.Count == 1)
                 {
+                    Program.Stage("填写右侧分屏网址");
                     Guard(); edits[0].SetFocus(); Thread.Sleep(100); Guard();
                     if (!Automation.Compare(AutomationElement.FocusedElement, edits[0])) throw new Stop("S02", "右侧地址输入框焦点不明确，请手动打开 DeepSeek。");
                     FillFreshAddress(edits[0]);
                     return;
                 }
                 // Some Edge builds provide an "open new tab" button instead of a URL field.
-                var fresh = PickerControls(ControlType.Button,originalDocs).Concat(PickerControls(ControlType.ListItem,originalDocs)).Concat(PickerControls(ControlType.Hyperlink,originalDocs)).Where(e => Rules.Named(Name(e), "新建标签页", "新标签页", "New tab", "Open a new tab", "打开新标签页") &&
-                    e.Current.BoundingRectangle.Left > bounds.Left + bounds.Width * 0.40 &&
-                    e.Current.BoundingRectangle.Top > bounds.Top + 110 && !originalDocs.Any(d => Under(e,d))).ToList();
+                var fresh = picker.Fresh;
                 if (fresh.Count == 1)
                 {
+                    Program.Stage("打开右侧分屏新标签页");
                     object action;
                     Guard();
                     if(fresh[0].TryGetCurrentPattern(InvokePattern.Pattern,out action)) ((InvokePattern)action).Invoke();
